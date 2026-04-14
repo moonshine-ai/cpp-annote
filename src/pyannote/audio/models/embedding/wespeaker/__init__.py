@@ -26,6 +26,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.onnx
 import torchaudio.compliance.kaldi as kaldi
 
 from pyannote.audio.core.model import Model
@@ -132,7 +133,18 @@ class BaseWeSpeakerResNet(Model):
         device = waveforms.device
         fft_device = torch.device("cpu") if device.type == "mps" else device
 
-        features = torch.vmap(self._fbank)(waveforms.to(fft_device)).to(device)
+        w = waveforms.to(fft_device)
+        # torch.vmap through torchaudio kaldi.fbank breaks under JIT/ONNX (channel / FakeTensor).
+        if (
+            torch.jit.is_tracing()
+            or torch.jit.is_scripting()
+            or torch.onnx.is_in_onnx_export()
+        ):
+            feats = [self._fbank(w[i]) for i in range(w.size(0))]
+            features = torch.stack(feats, dim=0)
+        else:
+            features = torch.vmap(self._fbank)(w)
+        features = features.to(device)
 
         # center features with global average
         if self.hparams.fbank_centering_span is None:

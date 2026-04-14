@@ -89,3 +89,9 @@ pyannote/audio/version.py
 
 # vim
 .vim
+
+# test data
+.callhome_eval_work/
+
+# virtual environment
+uv.lock
