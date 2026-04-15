@@ -23,9 +23,9 @@ Related: `cpp/porting-plan.md` (Section 11, golden artifact layout), `cpp/script
 | Stage | Python | C++ |
 |--------|--------|-----|
 | Binarized segmentations | `binarized_segmentations.npz` from dump | Same NPZ as input to clustering |
-| Filtered training rows | `BaseClustering.filter_embeddings` in `src/pyannote/audio/pipelines/clustering.py` | `filter_embeddings` in `cpp/port/clustering_vbx.cpp` |
-| AHC | `scipy.linkage` + `scipy.cluster.hierarchy.fcluster` | `scipy_linkage::*` in `cpp/port/scipy_linkage.hpp` |
-| PLDA features | `self.plda(train_embeddings)` | `PldaModel::operator()` in `cpp/port/plda_vbx.cpp` (aligned with `vbx_setup` in `src/pyannote/audio/utils/vbx.py`) |
+| Filtered training rows | `BaseClustering.filter_embeddings` in `src/pyannote/audio/pipelines/clustering.py` | `filter_embeddings` in `cpp/src/clustering_vbx.cpp` |
+| AHC | `scipy.linkage` + `scipy.cluster.hierarchy.fcluster` | `scipy_linkage::*` in `cpp/src/scipy_linkage.h` |
+| PLDA features | `self.plda(train_embeddings)` | `PldaModel::operator()` in `cpp/src/plda_vbx.cpp` (aligned with `vbx_setup` in `src/pyannote/audio/utils/vbx.py`) |
 | VBx | `cluster_vbx` → `VBx` in `vbx.py` (`maxIters=20`, `epsilon=1e-4`, `init_smoothing=7.0`) | `plda_vbx::cluster_vbx` (default `elbo_epsilon=1e-4`) |
 | Centroids / soft | `cdist` cosine, `soft = 2 - distance` | `cdist_cosine`, same formula |
 | Assignment | `scipy.optimize.linear_sum_assignment(..., maximize=True)` | `hungarian::min_cost_assignment` |
@@ -50,7 +50,7 @@ Related: `cpp/porting-plan.md` (Section 11, golden artifact layout), `cpp/script
 | `PYANNOTE_CPP_PARITY=1` | Light: one line after ORT embeddings, one after VBx (or skip line if `T < 2`). |
 | `PYANNOTE_CPP_PARITY=2` | Heavy: writes `vbx_parity_dump.npz` under `PYANNOTE_CPP_PARITY_OUT` (requires that directory). |
 
-Implementation: `cpp/port/parity_log.hpp`, `parity_log.cpp`; hooks in `cpp-annote.cpp` (embeddings) and `clustering_vbx.cpp` (VBx + dump).
+Implementation: `cpp/src/parity_log.h`, `parity_log.cpp`; hooks in `cpp-annote.cpp` (embeddings) and `clustering_vbx.cpp` (VBx + dump).
 
 `PYANNOTE_CPP_DIAG=1` remains separate (chunking / ORT shape only).
 
@@ -108,7 +108,7 @@ Printed stats: slot counts (`both_finite`, `gold_finite_ort_nan`, …), mean of 
 | `EMBEDDING_FULL_MAX_OR_NAN_SLOTS` | `200` | Max slots where golden row is finite but ORT is all-NaN (should stay `0` once weights-length parity holds). Use `0` to fail on any such slot. |
 | `EMBEDDING_FULL_MAX_FAIL_FRAC` | `0.10` | Max fraction of mutually-finite slots that violate `allclose(rtol=1e-2, atol=1e-3)`. |
 
-Shared ORT helpers live in **`cpp/port/embedding_ort_infer.hpp`** / **`embedding_ort_infer.cpp`** (also used by `cpp-annote-cli` / `cpp-annote.cpp`).
+Shared ORT helpers live in **`cpp/src/embedding_ort_infer.h`** / **`embedding_ort_infer.cpp`** (also used by `cpp-annote-cli` / `cpp-annote.cpp`).
 
 #### Investigating Torch-finite / ORT-NaN slots
 
@@ -163,7 +163,7 @@ C++: CLI flag or test binary dumping the same from `filter_embeddings`.
 
 **Implemented**
 
-- **`filter_train.hpp` / `filter_train.cpp`:** ``filter_embeddings_train`` matches Python ``VBxClustering.filter_embeddings`` (``segmentations.sum(axis=2)==1`` clean frames, ``num_clean_frames >= min_active_ratio * num_frames``, NaN filter). Used by ``clustering_vbx.cpp`` and tests.
+- **`filter_train.h` / `filter_train.cpp`:** ``filter_embeddings_train`` matches Python ``VBxClustering.filter_embeddings`` (``segmentations.sum(axis=2)==1`` clean frames, ``num_clean_frames >= min_active_ratio * num_frames``, NaN filter). Used by ``clustering_vbx.cpp`` and tests.
 - **`write_vbx_golden_reference.py`:** Uses the same NumPy filter as ``clustering.py``; writes ``train_chunk_idx``, ``train_speaker_idx``, ``fcluster_threshold`` into ``vbx_reference.npz`` alongside ``train_n``, ``pdist_condensed``, ``linkage_Z``, ``ahc``.
 - **`filter_ahc_golden_test`:** ``filter_ahc_golden_test <vbx_reference.npz>`` checks ``pdist`` / centroid ``linkage_Z`` / ``fcluster`` + contiguous remap vs the NPZ (threshold from ``fcluster_threshold`` when present, else 0.6). With a second argument ``<utterance_dir>``, also runs the C++ filter on ``embeddings.npz`` + ``binarized_segmentations.npz`` and checks indices vs NPZ and L2-normalized ``train`` vs ``train_n``.
 - **`linkage_fcluster_golden_test`:** Reads ``fcluster_threshold`` from the NPZ when present.

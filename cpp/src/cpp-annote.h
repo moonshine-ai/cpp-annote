@@ -6,8 +6,8 @@
 
 #include <onnxruntime_cxx_api.h>
 
-#include "clustering_vbx.hpp"
-#include "plda_vbx.hpp"
+#include "clustering_vbx.h"
+#include "plda_vbx.h"
 
 #include <cstdint>
 #include <memory>
@@ -31,12 +31,16 @@ struct DiarizationTurn {
   }
 };
 
-/// Loads segmentation ONNX, embedding ONNX, PLDA, receptive field, and pipeline snapshot once.
-/// Cluster assignments are produced in C++ via VBx in ``diarize``.
+/// Loads segmentation ONNX and embedding ONNX once. When optional paths are empty, community-1
+/// defaults compiled from ``export_cpp_annote_embedded.py`` are used (receptive field, pipeline snapshot,
+/// golden speaker bounds, ``xvec_transform`` / ``plda`` tensors). Cluster assignments are produced via VBx
+/// in ``diarize``.
 class CppAnnote {
  public:
-  /// ``embedding_onnx_path``, ``xvec_transform_npz_path``, and ``plda_npz_path`` must be non-empty.
-  /// Other paths default to the CallHome golden bundle layout (relative to process cwd).
+  /// ``embedding_onnx_path`` must be non-empty. Leave ``receptive_field_json_path``,
+  /// ``golden_speaker_bounds_json_path``, ``pipeline_snapshot_json_path`` empty to use embedded JSON;
+  /// leave ``xvec_transform_npz_path`` and ``plda_npz_path`` both empty to use embedded PLDA tensors,
+  /// or pass both NPZ paths to override.
   explicit CppAnnote(
       std::string segmentation_onnx_path,
       std::string receptive_field_json_path,
@@ -71,10 +75,8 @@ class CppAnnote {
   };
 
   std::string onnx_path_;
-  std::string receptive_field_path_;
-  std::string golden_bounds_path_;
-  std::string default_golden_bounds_path_;
-  std::string pipeline_snapshot_path_;
+  std::string default_golden_bounds_body_;
+  std::string golden_bounds_body_;
 
   SegConfig cfg_{};
   double rf_dur_ = 0.;
@@ -91,8 +93,6 @@ class CppAnnote {
   Ort::AllocatedStringPtr out_name_;
 
   std::string embedding_onnx_path_;
-  std::string xvec_npz_path_;
-  std::string plda_npz_path_;
   int embed_sr_ = 16000;
   int embed_mel_bins_ = 80;
   float embed_frame_length_ms_ = 25.f;

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "clustering_vbx.hpp"
+#include "clustering_vbx.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,10 +12,10 @@
 #include <stdexcept>
 
 #include "cnpy.h"
-#include "filter_train.hpp"
-#include "hungarian.hpp"
-#include "parity_log.hpp"
-#include "scipy_linkage.hpp"
+#include "filter_train.h"
+#include "hungarian.h"
+#include "parity_log.h"
+#include "scipy_linkage.h"
 
 namespace pyannote::clustering_vbx {
 namespace {

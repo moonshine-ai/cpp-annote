@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "embedding_ort_infer.hpp"
+#include "embedding_ort_infer.h"
 
 #include <array>
 #include <algorithm>
@@ -8,7 +8,7 @@
 #include <cstring>
 #include <vector>
 
-#include "compute_fbank.hpp"
+#include "compute_fbank.h"
 
 namespace pyannote::embedding_ort {
 namespace {

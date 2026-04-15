@@ -23,6 +23,23 @@ struct PldaModel {
   Eigen::VectorXd phi_between;
 
   void load(const std::string& xvec_transform_npz, const std::string& plda_npz, int lda_dim);
+
+  /// Load from raw NumPy-export tensors (same layout as HF ``xvec_transform.npz`` / ``plda.npz``).
+  void load_from_arrays(
+      const double* mean1,
+      int n_mean1,
+      const float* mean2,
+      int n_mean2,
+      const float* lda,
+      int lda_rows,
+      int lda_cols,
+      const double* mu,
+      int n_mu,
+      const double* tr,
+      int tr_side,
+      const double* psi,
+      int n_psi,
+      int lda_dim);
   [[nodiscard]] Eigen::MatrixXd xvec_tf(const Eigen::MatrixXd& embeddings) const;
   [[nodiscard]] Eigen::MatrixXd plda_tf(const Eigen::MatrixXd& x0, int lda_dim) const;
   [[nodiscard]] Eigen::MatrixXd operator()(const Eigen::MatrixXd& embeddings) const;

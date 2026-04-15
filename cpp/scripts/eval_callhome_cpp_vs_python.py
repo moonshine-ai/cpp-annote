@@ -331,9 +331,8 @@ def main() -> None:
         if not cpp_bin.is_file():
             raise SystemExit(f"C++ binary not found: {cpp_bin} (build with scripts/build_cpp.sh)")
         onnx = args.segmentation_onnx.resolve()
-        rf_json = golden_root / "receptive_field.json"
-        snap_json = golden_root / "pipeline_snapshot.json"
-        for p in (onnx, rf_json, snap_json):
+        emb_onnx = args.cpp_embedding_onnx.resolve()
+        for p in (onnx, emb_onnx):
             if not p.is_file():
                 raise SystemExit(f"Missing required file for C++: {p}")
 
@@ -354,14 +353,9 @@ def main() -> None:
             str(manifest_path),
             "--segmentation-onnx",
             str(onnx),
-            "--receptive-field",
-            str(rf_json),
-            "--pipeline-snapshot",
-            str(snap_json),
+            "--embedding-onnx",
+            str(emb_onnx),
         ]
-        emb_onnx = args.cpp_embedding_onnx.resolve()
-        if not emb_onnx.is_file():
-            raise SystemExit(f"C++ eval requires embedding ONNX: {emb_onnx}")
         if args.cpp_xvec is not None and args.cpp_plda is not None:
             xv = args.cpp_xvec.resolve()
             pl = args.cpp_plda.resolve()
@@ -369,16 +363,6 @@ def main() -> None:
             xv, pl = _hf_embedding_plda_paths(args.checkpoint, args.revision, token)
         xvec_resolved = xv
         plda_resolved = pl
-        cmd_cpp.extend(
-            [
-                "--embedding-onnx",
-                str(emb_onnx),
-                "--xvec-transform",
-                str(xv),
-                "--plda",
-                str(pl),
-            ]
-        )
         print("Running C++ batch:", cpp_bin.name, flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -132,6 +133,21 @@ def main() -> None:
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {out_path}")
     print(f"Wrote {meta_path}")
+
+    repo = _SCRIPT_DIR.parent.parent
+    regen = [
+        sys.executable,
+        str(_SCRIPT_DIR / "export_cpp_annote_embedded.py"),
+        "--repo-root",
+        str(repo),
+        "--checkpoint",
+        str(args.checkpoint),
+    ]
+    if args.revision:
+        regen.extend(["--revision", str(args.revision)])
+    if args.token:
+        regen.extend(["--token", str(args.token)])
+    subprocess.run(regen, check=True)
 
 
 if __name__ == "__main__":

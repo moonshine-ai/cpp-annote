@@ -99,7 +99,7 @@ if(APPLE)
 endif()
 
 add_executable(full_segmentation_window_parity_test tests/full_segmentation_window_parity_test.cpp)
-target_include_directories(full_segmentation_window_parity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(full_segmentation_window_parity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(full_segmentation_window_parity_test PRIVATE "${ORT_INCLUDE_DIR}")
 target_link_libraries(
   full_segmentation_window_parity_test PRIVATE cnpy_static "${ORT_LIBRARY}"
@@ -111,10 +111,10 @@ endif()
 add_executable(
   embedding_golden_test
   tests/embedding_golden_test.cpp
-  port/compute_fbank.cpp
-  port/embedding_ort_infer.cpp
+  src/compute_fbank.cpp
+  src/embedding_ort_infer.cpp
 )
-target_include_directories(embedding_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(embedding_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(embedding_golden_test PRIVATE "${ORT_INCLUDE_DIR}")
 target_link_libraries(
   embedding_golden_test PRIVATE cnpy_static "${ORT_LIBRARY}"
@@ -142,59 +142,60 @@ add_executable(reconstruct_golden_test tests/reconstruct_golden_test.cpp)
 target_link_libraries(reconstruct_golden_test PRIVATE cnpy_static)
 
 add_executable(annotation_golden_test tests/annotation_golden_test.cpp)
-target_include_directories(annotation_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(annotation_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(annotation_golden_test PRIVATE cnpy_static)
 
 add_executable(
   clustering_golden_test
   tests/clustering_golden_test.cpp
-  port/scipy_linkage.cpp
-  port/filter_train.cpp
-  port/plda_vbx.cpp
-  port/clustering_vbx.cpp
-  port/parity_log.cpp
+  src/scipy_linkage.cpp
+  src/filter_train.cpp
+  src/plda_vbx.cpp
+  src/clustering_vbx.cpp
+  src/parity_log.cpp
 )
-target_include_directories(clustering_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(clustering_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(clustering_golden_test PRIVATE cnpy_static eigen_mpl2)
 
-add_executable(vbx_parity_test tests/vbx_parity_test.cpp port/plda_vbx.cpp)
-target_include_directories(vbx_parity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+add_executable(vbx_parity_test tests/vbx_parity_test.cpp src/plda_vbx.cpp)
+target_include_directories(vbx_parity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(vbx_parity_test PRIVATE cnpy_static eigen_mpl2)
 
-add_executable(plda_fea_golden_test tests/plda_fea_golden_test.cpp port/plda_vbx.cpp)
-target_include_directories(plda_fea_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+add_executable(plda_fea_golden_test tests/plda_fea_golden_test.cpp src/plda_vbx.cpp)
+target_include_directories(plda_fea_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(plda_fea_golden_test PRIVATE cnpy_static eigen_mpl2)
 
 add_executable(
   linkage_fcluster_golden_test
   tests/linkage_fcluster_golden_test.cpp
-  port/scipy_linkage.cpp
+  src/scipy_linkage.cpp
 )
-target_include_directories(linkage_fcluster_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(linkage_fcluster_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(linkage_fcluster_golden_test PRIVATE cnpy_static)
 
 add_executable(
   filter_ahc_golden_test
   tests/filter_ahc_golden_test.cpp
-  port/filter_train.cpp
-  port/scipy_linkage.cpp
+  src/filter_train.cpp
+  src/scipy_linkage.cpp
 )
-target_include_directories(filter_ahc_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(filter_ahc_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(filter_ahc_golden_test PRIVATE cnpy_static eigen_mpl2)
 
 add_executable(
   cpp-annote-cli
   tools/cpp-annote-cli.cpp
-  port/cpp-annote.cpp
-  port/compute_fbank.cpp
-  port/embedding_ort_infer.cpp
-  port/filter_train.cpp
-  port/clustering_vbx.cpp
-  port/plda_vbx.cpp
-  port/scipy_linkage.cpp
-  port/parity_log.cpp
+  src/cpp-annote.cpp
+  src/community1_cpp_annote_embedded.cpp
+  src/compute_fbank.cpp
+  src/embedding_ort_infer.cpp
+  src/filter_train.cpp
+  src/clustering_vbx.cpp
+  src/plda_vbx.cpp
+  src/scipy_linkage.cpp
+  src/parity_log.cpp
 )
-target_include_directories(cpp-annote-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(cpp-annote-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(cpp-annote-cli PRIVATE "${ORT_INCLUDE_DIR}")
 target_link_libraries(cpp-annote-cli PRIVATE cnpy_static "${ORT_LIBRARY}" eigen_mpl2)
 if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)

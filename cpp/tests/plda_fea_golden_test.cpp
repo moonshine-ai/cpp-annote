@@ -7,7 +7,7 @@
 #include <string>
 
 #include "cnpy.h"
-#include "plda_vbx.hpp"
+#include "plda_vbx.h"
 
 static double max_abs_mat(const Eigen::MatrixXd& a, const double* b, int rows, int cols) {
   double m = 0.0;

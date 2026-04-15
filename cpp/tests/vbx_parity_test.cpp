@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "cnpy.h"
-#include "plda_vbx.hpp"
+#include "plda_vbx.h"
 
 /// ``b`` is one slice of NumPy ``gamma_trace[it]`` with C-order shape ``(T, S)`` (row-major: ``t`` varies slow, ``s`` fast).
 static double max_abs_gamma_ts(const Eigen::MatrixXd& a, const double* b, int T, int S) {

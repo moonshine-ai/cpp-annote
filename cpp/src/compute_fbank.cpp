@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "compute_fbank.hpp"
+#include "compute_fbank.h"
 
 #include <algorithm>
 #include <cmath>

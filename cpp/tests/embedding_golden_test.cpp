@@ -21,9 +21,9 @@
 #include <vector>
 
 #include "cnpy.h"
-#include "compute_fbank.hpp"
-#include "embedding_ort_infer.hpp"
-#include "wav_pcm_float32.hpp"
+#include "compute_fbank.h"
+#include "embedding_ort_infer.h"
+#include "wav_pcm_float32.h"
 
 static std::string read_text_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary);

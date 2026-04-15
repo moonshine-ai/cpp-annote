@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "pyannote.hpp"
+#include "cpp-annote.h"
 
 #include <algorithm>
 #include <cctype>
@@ -20,13 +20,14 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "annotation_support.hpp"
-#include "clustering_vbx.hpp"
-#include "compute_fbank.hpp"
-#include "embedding_ort_infer.hpp"
-#include "parity_log.hpp"
-#include "plda_vbx.hpp"
-#include "wav_pcm_float32.hpp"
+#include "annotation_support.h"
+#include "clustering_vbx.h"
+#include "compute_fbank.h"
+#include "embedding_ort_infer.h"
+#include "parity_log.h"
+#include "plda_vbx.h"
+#include "wav_pcm_float32.h"
+#include "community1_cpp_annote_embedded.h"
 
 namespace pyannote {
 namespace detail {
@@ -569,13 +570,7 @@ CppAnnote::CppAnnote(
     std::string xvec_transform_npz_path,
     std::string plda_npz_path)
     : onnx_path_(std::move(segmentation_onnx_path)),
-      receptive_field_path_(std::move(receptive_field_json_path)),
-      default_golden_bounds_path_(golden_speaker_bounds_json_path),
-      golden_bounds_path_(golden_speaker_bounds_json_path),
-      pipeline_snapshot_path_(std::move(pipeline_snapshot_json_path)),
       embedding_onnx_path_(std::move(embedding_onnx_path)),
-      xvec_npz_path_(std::move(xvec_transform_npz_path)),
-      plda_npz_path_(std::move(plda_npz_path)),
       ort_env_(ORT_LOGGING_LEVEL_WARNING, "pyannote_cpp"),
       session_options_{},
       session_(ort_env_, onnx_path_.c_str(), session_options_),
@@ -583,8 +578,13 @@ CppAnnote::CppAnnote(
       alloc_{},
       in_name_(session_.GetInputNameAllocated(0, alloc_)),
       out_name_(session_.GetOutputNameAllocated(0, alloc_)) {
-  if (embedding_onnx_path_.empty() || xvec_npz_path_.empty() || plda_npz_path_.empty()) {
-    throw std::runtime_error("CppAnnote requires embedding ONNX, xvec transform NPZ, and PLDA NPZ paths");
+  if (embedding_onnx_path_.empty()) {
+    throw std::runtime_error("CppAnnote requires embedding ONNX path");
+  }
+  const bool embedded_plda = xvec_transform_npz_path.empty() && plda_npz_path.empty();
+  if (!embedded_plda && (xvec_transform_npz_path.empty() || plda_npz_path.empty())) {
+    throw std::runtime_error(
+        "CppAnnote: provide both xvec_transform and PLDA NPZ paths, or neither for embedded community-1 weights");
   }
   std::string json_path = onnx_path_;
   if (json_path.size() > 5 && json_path.substr(json_path.size() - 5) == ".onnx") {
@@ -607,12 +607,20 @@ CppAnnote::CppAnnote(
   }
   cfg_.chunk_dur_sec = json_double(seg_json, "chunk_duration_sec");
 
-  const std::string rf_txt = read_text(receptive_field_path_);
+  const std::string rf_txt = receptive_field_json_path.empty()
+      ? std::string(
+            pyannote::embedded_community1::receptive_field_json,
+            pyannote::embedded_community1::receptive_field_json_size)
+      : read_text(receptive_field_json_path);
   rf_dur_ = json_double(rf_txt, "duration");
   rf_step_ = json_double(rf_txt, "step");
 
-  if (!pipeline_snapshot_path_.empty()) {
-    const std::string sj = read_text(pipeline_snapshot_path_);
+  {
+    const std::string sj = pipeline_snapshot_json_path.empty()
+        ? std::string(
+              pyannote::embedded_community1::pipeline_snapshot_json,
+              pyannote::embedded_community1::pipeline_snapshot_json_size)
+        : read_text(pipeline_snapshot_json_path);
     try_regex_double(sj, "segmentation\\.min_duration_off", min_off_);
     try_regex_double(sj, "segmentation\\.min_duration_on", min_on_);
     try_json_bool_field(sj, "embedding_exclude_overlap", embedding_exclude_overlap_);
@@ -626,6 +634,13 @@ CppAnnote::CppAnnote(
       }
     }
   }
+
+  default_golden_bounds_body_ = golden_speaker_bounds_json_path.empty()
+      ? std::string(
+            pyannote::embedded_community1::golden_speaker_bounds_json,
+            pyannote::embedded_community1::golden_speaker_bounds_json_size)
+      : read_text(golden_speaker_bounds_json_path);
+  golden_bounds_body_ = default_golden_bounds_body_;
 
   {
     std::string emb_json_path = embedding_onnx_path_;
@@ -653,7 +668,25 @@ CppAnnote::CppAnnote(
         embed_frame_shift_ms_,
         embed_dim_);
     plda_model_ = std::make_unique<plda_vbx::PldaModel>();
-    plda_model_->load(xvec_npz_path_, plda_npz_path_, vbx_params_.lda_dimension);
+    if (embedded_plda) {
+      plda_model_->load_from_arrays(
+          pyannote::embedded_community1::xvec_mean1,
+          pyannote::embedded_community1::kEmbeddingDim,
+          pyannote::embedded_community1::xvec_mean2,
+          pyannote::embedded_community1::kLdaOutDim,
+          pyannote::embedded_community1::xvec_lda,
+          pyannote::embedded_community1::kEmbeddingDim,
+          pyannote::embedded_community1::kLdaOutDim,
+          pyannote::embedded_community1::plda_mu,
+          pyannote::embedded_community1::kPldaDim,
+          pyannote::embedded_community1::plda_tr,
+          pyannote::embedded_community1::kPldaDim,
+          pyannote::embedded_community1::plda_psi,
+          pyannote::embedded_community1::kPldaDim,
+          vbx_params_.lda_dimension);
+    } else {
+      plda_model_->load(xvec_transform_npz_path, plda_npz_path, vbx_params_.lda_dimension);
+    }
     vbx_params_.min_clusters = 1;
     vbx_params_.max_clusters = 1000000000;
     vbx_params_.num_clusters = -1;
@@ -662,9 +695,9 @@ CppAnnote::CppAnnote(
 
 void CppAnnote::set_golden_speaker_bounds(std::string golden_speaker_bounds_json_path) {
   if (!golden_speaker_bounds_json_path.empty()) {
-    golden_bounds_path_ = std::move(golden_speaker_bounds_json_path);
+    golden_bounds_body_ = read_text(golden_speaker_bounds_json_path);
   } else {
-    golden_bounds_path_ = default_golden_bounds_path_;
+    golden_bounds_body_ = default_golden_bounds_body_;
   }
 }
 
@@ -919,8 +952,8 @@ std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, s
     return {};
   }
   int max_cap = INT_MAX;
-  if (!golden_bounds_path_.empty()) {
-    const std::string bj = read_text(golden_bounds_path_);
+  if (!golden_bounds_body_.empty()) {
+    const std::string& bj = golden_bounds_body_;
     std::regex re("\"max_speakers\"\\s*:\\s*(null|[-+0-9]+)");
     std::smatch m;
     if (std::regex_search(bj, m, re) && m[1].str() != "null") {

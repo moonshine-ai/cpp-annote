@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "parity_log.hpp"
+#include "parity_log.h"
 
 #include <cstdio>
 #include <cstdlib>

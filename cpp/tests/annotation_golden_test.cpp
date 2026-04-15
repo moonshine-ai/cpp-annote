@@ -13,7 +13,7 @@
 #include <tuple>
 #include <vector>
 
-#include "annotation_support.hpp"
+#include "annotation_support.h"
 #include "cnpy.h"
 
 struct CanonicalTurn {

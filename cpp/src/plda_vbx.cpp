@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "plda_vbx.hpp"
+#include "plda_vbx.h"
 
 #include <array>
 #include <cmath>
@@ -9,36 +9,8 @@
 #include "cnpy.h"
 
 namespace pyannote::plda_vbx {
-namespace {
 
 using RowMatrixXf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-
-void row_l2_normalize(Eigen::MatrixXd& M) {
-  for (int i = 0; i < M.rows(); ++i) {
-    double n = M.row(i).norm();
-    if (n > 1e-12) {
-      M.row(i) /= n;
-    }
-  }
-}
-
-void logsumexp_rowwise(const Eigen::MatrixXd& M, Eigen::VectorXd& lse, Eigen::MatrixXd& centered) {
-  const int r = static_cast<int>(M.rows());
-  const int c = static_cast<int>(M.cols());
-  lse.resize(r);
-  centered.resize(r, c);
-  for (int i = 0; i < r; ++i) {
-    const double m = M.row(i).maxCoeff();
-    double s = 0.0;
-    for (int j = 0; j < c; ++j) {
-      s += std::exp(M(i, j) - m);
-    }
-    lse(i) = m + std::log(std::max(s, 1e-300));
-    for (int j = 0; j < c; ++j) {
-      centered(i, j) = M(i, j) - lse(i);
-    }
-  }
-}
 
 // Hugging Face ``pyannote/speaker-diarization-community-1`` ``plda.npz`` (128×128 ``tr``): Eigen's
 // generalized eigenvectors can differ from SciPy ``eigh`` by **per-column** signs. Fingerprint ``tr``,
@@ -97,7 +69,83 @@ void align_eigen_evecs_to_scipy_wccn_row0_for_community1_plda(const RowMatrixXd&
   }
 }
 
+namespace {
+
+void row_l2_normalize(Eigen::MatrixXd& M) {
+  for (int i = 0; i < M.rows(); ++i) {
+    double n = M.row(i).norm();
+    if (n > 1e-12) {
+      M.row(i) /= n;
+    }
+  }
+}
+
+void logsumexp_rowwise(const Eigen::MatrixXd& M, Eigen::VectorXd& lse, Eigen::MatrixXd& centered) {
+  const int r = static_cast<int>(M.rows());
+  const int c = static_cast<int>(M.cols());
+  lse.resize(r);
+  centered.resize(r, c);
+  for (int i = 0; i < r; ++i) {
+    const double m = M.row(i).maxCoeff();
+    double s = 0.0;
+    for (int j = 0; j < c; ++j) {
+      s += std::exp(M(i, j) - m);
+    }
+    lse(i) = m + std::log(std::max(s, 1e-300));
+    for (int j = 0; j < c; ++j) {
+      centered(i, j) = M(i, j) - lse(i);
+    }
+  }
+}
+
 }  // namespace
+
+void PldaModel::load_from_arrays(
+    const double* mean1_p,
+    int n_mean1,
+    const float* mean2_p,
+    int n_mean2,
+    const float* lda_p,
+    int lda_rows,
+    int lda_cols,
+    const double* mu_p,
+    int n_mu,
+    const double* tr_p,
+    int tr_side,
+    const double* psi_p,
+    int n_psi,
+    int lda_dim) {
+  lda_dimension = lda_dim;
+  mean1 = Eigen::Map<const Eigen::VectorXd>(mean1_p, n_mean1);
+  mean2 = Eigen::Map<const Eigen::VectorXf>(mean2_p, n_mean2).cast<double>();
+  lda = Eigen::Map<const RowMatrixXf>(lda_p, lda_rows, lda_cols).cast<double>();
+  plda_mu = Eigen::Map<const Eigen::VectorXd>(mu_p, n_mu);
+  Eigen::MatrixXd tr_file = Eigen::Map<const RowMatrixXd>(tr_p, tr_side, tr_side);
+  Eigen::VectorXd psi_file = Eigen::Map<const Eigen::VectorXd>(psi_p, n_psi);
+  const Eigen::MatrixXd Wmat = (tr_file.transpose() * tr_file).inverse();
+  Eigen::MatrixXd tr_t = tr_file.transpose();
+  for (int j = 0; j < tr_t.cols(); ++j) {
+    tr_t.col(j) /= std::max(psi_file(j), 1e-12);
+  }
+  const Eigen::MatrixXd Bmat = (tr_t * tr_file).inverse();
+  Eigen::GeneralizedSelfAdjointEigenSolver<Eigen::MatrixXd> ges(Bmat, Wmat);
+  if (ges.info() != Eigen::Success) {
+    throw std::runtime_error("generalized eigen decomposition failed in vbx_setup");
+  }
+  Eigen::VectorXd evals = ges.eigenvalues();
+  Eigen::MatrixXd evecs = ges.eigenvectors();
+  align_eigen_evecs_to_scipy_wccn_row0_for_community1_plda(tr_file, evecs);
+  const int d = static_cast<int>(evals.size());
+  phi_between.resize(std::min(d, lda_dimension));
+  for (int i = 0; i < phi_between.size(); ++i) {
+    phi_between(i) = evals(d - 1 - i);
+  }
+  const Eigen::MatrixXd Et = evecs.transpose();
+  plda_tr.resize(d, d);
+  for (int i = 0; i < d; ++i) {
+    plda_tr.row(i) = Et.row(d - 1 - i);
+  }
+}
 
 void PldaModel::load(const std::string& xvec_transform_npz, const std::string& plda_npz, int lda_dim) {
   lda_dimension = lda_dim;
@@ -156,14 +204,11 @@ void PldaModel::load(const std::string& xvec_transform_npz, const std::string& p
   }
 
   const Eigen::MatrixXd Wmat = (tr_file.transpose() * tr_file).inverse();
-  // Match NumPy ``(plda_tr.T / plda_psi)``: with shapes ``(d,d) / (d,)``, ``psi`` aligns with the
-  // last axis, so column ``j`` is divided by ``psi[j]`` (not row ``i`` by ``psi[i]``).
   Eigen::MatrixXd tr_t = tr_file.transpose();
   for (int j = 0; j < tr_t.cols(); ++j) {
     tr_t.col(j) /= std::max(psi_file(j), 1e-12);
   }
   const Eigen::MatrixXd Bmat = (tr_t * tr_file).inverse();
-
   Eigen::GeneralizedSelfAdjointEigenSolver<Eigen::MatrixXd> ges(Bmat, Wmat);
   if (ges.info() != Eigen::Success) {
     throw std::runtime_error("generalized eigen decomposition failed in vbx_setup");
@@ -176,7 +221,6 @@ void PldaModel::load(const std::string& xvec_transform_npz, const std::string& p
   for (int i = 0; i < phi_between.size(); ++i) {
     phi_between(i) = evals(d - 1 - i);
   }
-  // Match ``vbx_setup``: ``plda_tr = wccn.T[::-1]`` (SciPy ``eigh`` eigenvectors are columns, ascending eigenvalues).
   const Eigen::MatrixXd Et = evecs.transpose();
   plda_tr.resize(d, d);
   for (int i = 0; i < d; ++i) {

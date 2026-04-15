@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "scipy_linkage.hpp"
+#include "scipy_linkage.h"
 
 #include <algorithm>
 #include <cmath>

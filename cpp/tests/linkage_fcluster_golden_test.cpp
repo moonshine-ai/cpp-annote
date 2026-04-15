@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "cnpy.h"
-#include "scipy_linkage.hpp"
+#include "scipy_linkage.h"
 
 static double max_abs_diff(const std::vector<double>& a, const double* b, size_t n) {
   double m = 0.0;

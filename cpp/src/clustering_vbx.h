@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "plda_vbx.hpp"
+#include "plda_vbx.h"
 
 namespace pyannote::clustering_vbx {
 

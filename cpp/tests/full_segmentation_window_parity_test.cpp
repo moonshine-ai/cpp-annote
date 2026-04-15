@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "cnpy.h"
-#include "wav_pcm_float32.hpp"
+#include "wav_pcm_float32.h"
 
 static std::string read_text_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary);

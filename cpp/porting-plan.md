@@ -242,5 +242,5 @@ Document in `DiarizationConfig` (single source for C++ and test generators):
 | 2026-04-14 | `speaker_count_golden_test` also checks **`speaker_count_capped.npz`**; dump writes **`golden_speaker_bounds.json`**. |
 | 2026-04-14 | **`reconstruct_golden_test`**: C++ parity for `reconstruct` + `to_diarization` vs discrete diarization NPZs. |
 | 2026-04-14 | **`annotation_golden_test`**: `Binarize` / `to_annotation` vs golden diarization JSON (+ label mapping). |
-| 2026-04-14 | **`cpp/port/annotation_support.hpp`**: `Timeline.support` + `Annotation.support` (collar merge + second pass) for `min_duration_off` / golden parity. |
-| 2026-04-14 | **`cpp-annote-cli`**: WAV + sliding segmentation ORT + VBx clustering → JSON; **`wav_pcm_float32.hpp`**; export JSON gains **`chunk_step_sec`**. |
+| 2026-04-14 | **`cpp/src/annotation_support.h`**: `Timeline.support` + `Annotation.support` (collar merge + second pass) for `min_duration_off` / golden parity. |
+| 2026-04-14 | **`cpp-annote-cli`**: WAV + sliding segmentation ORT + VBx clustering → JSON; **`wav_pcm_float32.h`**; export JSON gains **`chunk_step_sec`**. |

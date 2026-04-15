@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#include "filter_train.hpp"
+#include "filter_train.h"
 
 #include <cmath>
 #include <vector>

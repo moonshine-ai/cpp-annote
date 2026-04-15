@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// CLI for short-path diarization; core logic lives in ``port/pyannote.hpp`` (class ``pyannote::CppAnnote``).
+// CLI for short-path diarization; core logic lives in ``src/cpp-annote.h`` (class ``pyannote::CppAnnote``).
 
 #include <cstdint>
 #include <cctype>
@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "pyannote.hpp"
-#include "wav_pcm_float32.hpp"
+#include "cpp-annote.h"
+#include "wav_pcm_float32.h"
 
 namespace fs = std::filesystem;
 
@@ -137,10 +137,7 @@ int main(int argc, char** argv) {
         << "cpp-annote-cli — WAV + segmentation ORT + ORT embedding + VBx → diarization JSON.\n\n"
         << "Required for every run:\n"
         << "  --segmentation-onnx PATH   (metadata: same stem .json)\n"
-        << "  --receptive-field PATH     receptive_field.json\n"
-        << "  --embedding-onnx PATH      community1-embedding.onnx (+ same-stem .json)\n"
-        << "  --xvec-transform PATH      xvec_transform.npz\n"
-        << "  --plda PATH                plda.npz\n\n"
+        << "  --embedding-onnx PATH      community1-embedding.onnx (+ same-stem .json)\n\n"
         << "Single file:\n"
         << "  --wav PATH\n"
         << "  --out PATH                 output diarization.json\n\n"
@@ -152,9 +149,12 @@ int main(int argc, char** argv) {
         << "  --out-dir PATH             required for 1-column manifest lines; also for --wav-list\n\n"
         << "Batch — one WAV path per line:\n"
         << "  --wav-list PATH            requires --out-dir; writes OUT/<stem>.json per line\n\n"
-        << "Optional (all modes):\n"
+        << "Optional overrides (defaults compiled into the binary from export_cpp_annote_embedded.py):\n"
+        << "  --receptive-field PATH         receptive_field.json\n"
+        << "  --pipeline-snapshot PATH       pipeline_snapshot.json\n"
         << "  --golden-speaker-bounds PATH   default max_speakers cap when a job omits per-utterance bounds\n"
-        << "  --pipeline-snapshot PATH       pipeline_snapshot.json (segmentation / clustering / embedding)\n"
+        << "  --xvec-transform PATH          xvec_transform.npz (must pair with --plda)\n"
+        << "  --plda PATH                    plda.npz\n"
         << "  --continue-on-error            batch only: print error and continue; exit 1 if any failed\n";
     return 2;
   }
@@ -172,8 +172,11 @@ int main(int argc, char** argv) {
     const std::string plda_npz = get_arg(argc, argv, "--plda");
     const bool continue_on_error = has_flag(argc, argv, "--continue-on-error");
 
-    if (embed_onnx.empty() || xvec_npz.empty() || plda_npz.empty()) {
-      throw std::runtime_error("missing --embedding-onnx, --xvec-transform, or --plda (see --help)");
+    if (embed_onnx.empty()) {
+      throw std::runtime_error("missing --embedding-onnx (see --help)");
+    }
+    if ((!xvec_npz.empty() && plda_npz.empty()) || (xvec_npz.empty() && !plda_npz.empty())) {
+      throw std::runtime_error("provide both --xvec-transform and --plda, or neither for embedded weights");
     }
 
     std::vector<DiarJob> jobs;
@@ -201,8 +204,8 @@ int main(int argc, char** argv) {
       jobs.push_back({wav_path, "", out_path});
     }
 
-    if (onnx_path.empty() || rf_path.empty()) {
-      throw std::runtime_error("missing --segmentation-onnx or --receptive-field");
+    if (onnx_path.empty()) {
+      throw std::runtime_error("missing --segmentation-onnx");
     }
 
     pyannote::CppAnnote engine(

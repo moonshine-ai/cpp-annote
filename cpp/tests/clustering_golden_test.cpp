@@ -10,9 +10,9 @@
 #include <string>
 #include <vector>
 
-#include "clustering_vbx.hpp"
+#include "clustering_vbx.h"
 #include "cnpy.h"
-#include "plda_vbx.hpp"
+#include "plda_vbx.h"
 
 static float max_abs_diff_int8(const std::vector<std::int8_t>& a, const std::int8_t* b, size_t n) {
   float m = 0.f;
