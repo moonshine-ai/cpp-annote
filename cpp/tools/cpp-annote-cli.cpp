@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// CLI for short-path diarization; core logic lives in ``port/pyannote.hpp`` (class ``pyannote::Pyannote``).
+// CLI for short-path diarization; core logic lives in ``port/pyannote.hpp`` (class ``pyannote::CppAnnote``).
 
 #include <cstdint>
 #include <cctype>
@@ -35,8 +35,7 @@ static bool has_flag(int argc, char** argv, const char* key) {
 
 struct DiarJob {
   std::string wav;
-  std::string clusters;
-  std::string label_mapping;
+  /// Optional per-utterance ``golden_speaker_bounds.json``; empty uses constructor default.
   std::string golden_bounds;
   std::string out;
 };
@@ -86,21 +85,20 @@ static std::vector<DiarJob> load_manifest_jobs(const std::string& manifest_path,
     while (!cols.empty() && cols.back().empty()) {
       cols.pop_back();
     }
-    if (cols.size() == 3) {
+    if (cols.size() == 1) {
       if (out_dir.empty()) {
-        throw std::runtime_error("manifest line " + std::to_string(lineno) +
-                                 ": three columns require --out-dir (wav, clusters, label_mapping)");
+        throw std::runtime_error("manifest " + manifest_path + " line " + std::to_string(lineno) +
+                                 ": single-column lines require --out-dir (wav path only)");
       }
       const fs::path wv(cols[0]);
-      jobs.push_back(
-          {cols[0], cols[1], cols[2], "", (fs::path(out_dir) / (wv.stem().string() + ".json")).string()});
-    } else if (cols.size() == 4) {
-      jobs.push_back({cols[0], cols[1], cols[2], "", cols[3]});
-    } else if (cols.size() == 5) {
-      jobs.push_back({cols[0], cols[1], cols[2], cols[3], cols[4]});
+      jobs.push_back({cols[0], "", (fs::path(out_dir) / (wv.stem().string() + ".json")).string()});
+    } else if (cols.size() == 2) {
+      jobs.push_back({cols[0], "", cols[1]});
+    } else if (cols.size() == 3) {
+      jobs.push_back({cols[0], cols[1], cols[2]});
     } else {
       throw std::runtime_error("manifest " + manifest_path + " line " + std::to_string(lineno) +
-                               ": expected 3, 4, or 5 tab-separated fields");
+                               ": expected 1, 2, or 3 tab-separated fields (wav | wav,out | wav,bounds,out)");
     }
   }
   if (jobs.empty()) {
@@ -109,8 +107,7 @@ static std::vector<DiarJob> load_manifest_jobs(const std::string& manifest_path,
   return jobs;
 }
 
-static std::vector<DiarJob> load_wav_list_jobs(
-    const std::string& list_path, const fs::path& artifact_base, const fs::path& out_dir) {
+static std::vector<DiarJob> load_wav_list_jobs(const std::string& list_path, const fs::path& out_dir) {
   std::vector<DiarJob> jobs;
   std::ifstream f(list_path);
   if (!f) {
@@ -126,17 +123,7 @@ static std::vector<DiarJob> load_wav_list_jobs(
     }
     const fs::path wv(line);
     const std::string stem = wv.stem().string();
-    const fs::path sub = artifact_base / stem;
-    DiarJob j;
-    j.wav = line;
-    j.clusters = (sub / "hard_clusters_final.npz").string();
-    j.label_mapping = (sub / "label_mapping.json").string();
-    const fs::path gb = sub / "golden_speaker_bounds.json";
-    if (fs::exists(gb)) {
-      j.golden_bounds = gb.string();
-    }
-    j.out = (out_dir / (stem + ".json")).string();
-    jobs.push_back(std::move(j));
+    jobs.push_back({line, "", (out_dir / (stem + ".json")).string()});
   }
   if (jobs.empty()) {
     throw std::runtime_error("wav-list has no paths: " + list_path);
@@ -147,34 +134,27 @@ static std::vector<DiarJob> load_wav_list_jobs(
 int main(int argc, char** argv) {
   if (argc < 2 || has_flag(argc, argv, "--help")) {
     std::cerr
-        << "community1_shortpath — WAV + segmentation ORT → diarization JSON "
-           "(oracle clusters and/or full VBx; see flags).\n\n"
-        << "Single file (required):\n"
-        << "  --wav PATH\n"
+        << "cpp-annote-cli — WAV + segmentation ORT + ORT embedding + VBx → diarization JSON.\n\n"
+        << "Required for every run:\n"
         << "  --segmentation-onnx PATH   (metadata: same stem .json)\n"
         << "  --receptive-field PATH     receptive_field.json\n"
-        << "  --clusters PATH            hard_clusters_final.npz\n"
-        << "  --label-mapping PATH       label_mapping.json\n"
+        << "  --embedding-onnx PATH      community1-embedding.onnx (+ same-stem .json)\n"
+        << "  --xvec-transform PATH      xvec_transform.npz\n"
+        << "  --plda PATH                plda.npz\n\n"
+        << "Single file:\n"
+        << "  --wav PATH\n"
         << "  --out PATH                 output diarization.json\n\n"
         << "Batch — tab-separated manifest (one job per line, # comments OK):\n"
         << "  --manifest PATH\n"
-        << "    Line with 3 fields:  wav<TAB>clusters.npz<TAB>label_mapping.json  (needs --out-dir)\n"
-        << "    Line with 4 fields:  wav<TAB>clusters<TAB>label_mapping<TAB>out.json\n"
-        << "    Line with 5 fields:  wav<TAB>clusters<TAB>label_mapping<TAB>golden_speaker_bounds<TAB>out.json\n"
-        << "  --out-dir PATH             required for 3-column manifest lines\n\n"
-        << "Batch — one WAV path per line (same layout as Python golden dirs):\n"
-        << "  --wav-list PATH            list file; each line is a .wav path\n"
-        << "  --artifact-base BASE        use BASE/<wav_stem>/hard_clusters_final.npz, label_mapping.json,\n"
-        << "                             and golden_speaker_bounds.json if present\n"
-        << "  --out-dir PATH             write OUT/<wav_stem>.json for each line\n\n"
-        << "Full C++ pipeline (segmentation + ORT embedding + VBx; no oracle clusters NPZ):\n"
-        << "  --embedding-onnx PATH      community1-embedding.onnx (+ same-stem .json)\n"
-        << "  --xvec-transform PATH      xvec_transform.npz\n"
-        << "  --plda PATH                plda.npz\n"
-        << "  When all three are set, --clusters / manifest clusters column are ignored.\n\n"
+        << "    1 field:   wav   (requires --out-dir → OUT/<wav_stem>.json)\n"
+        << "    2 fields:  wav<TAB>out.json\n"
+        << "    3 fields:  wav<TAB>golden_speaker_bounds.json<TAB>out.json\n"
+        << "  --out-dir PATH             required for 1-column manifest lines; also for --wav-list\n\n"
+        << "Batch — one WAV path per line:\n"
+        << "  --wav-list PATH            requires --out-dir; writes OUT/<stem>.json per line\n\n"
         << "Optional (all modes):\n"
-        << "  --golden-speaker-bounds PATH   used when a job has no per-utterance bounds (manifest/wav-list)\n"
-        << "  --pipeline-snapshot PATH       pipeline_snapshot.json (segmentation.min_duration_*)\n"
+        << "  --golden-speaker-bounds PATH   default max_speakers cap when a job omits per-utterance bounds\n"
+        << "  --pipeline-snapshot PATH       pipeline_snapshot.json (segmentation / clustering / embedding)\n"
         << "  --continue-on-error            batch only: print error and continue; exit 1 if any failed\n";
     return 2;
   }
@@ -185,14 +165,16 @@ int main(int argc, char** argv) {
     const std::string wav_list_path = get_arg(argc, argv, "--wav-list");
     const std::string wav_path = get_arg(argc, argv, "--wav");
     const std::string out_dir = get_arg(argc, argv, "--out-dir");
-    const std::string artifact_base_str = get_arg(argc, argv, "--artifact-base");
     const std::string global_bounds = get_arg(argc, argv, "--golden-speaker-bounds");
     const std::string snap = get_arg(argc, argv, "--pipeline-snapshot");
     const std::string embed_onnx = get_arg(argc, argv, "--embedding-onnx");
     const std::string xvec_npz = get_arg(argc, argv, "--xvec-transform");
     const std::string plda_npz = get_arg(argc, argv, "--plda");
     const bool continue_on_error = has_flag(argc, argv, "--continue-on-error");
-    const bool vbx_cli = !embed_onnx.empty() && !xvec_npz.empty() && !plda_npz.empty();
+
+    if (embed_onnx.empty() || xvec_npz.empty() || plda_npz.empty()) {
+      throw std::runtime_error("missing --embedding-onnx, --xvec-transform, or --plda (see --help)");
+    }
 
     std::vector<DiarJob> jobs;
     if (!manifest_path.empty()) {
@@ -204,35 +186,28 @@ int main(int argc, char** argv) {
       if (!wav_path.empty()) {
         throw std::runtime_error("use only one of --manifest, --wav-list, or --wav");
       }
-      if (artifact_base_str.empty() || out_dir.empty()) {
-        throw std::runtime_error("--wav-list requires --artifact-base and --out-dir");
+      if (out_dir.empty()) {
+        throw std::runtime_error("--wav-list requires --out-dir");
       }
-      jobs = load_wav_list_jobs(wav_list_path, fs::path(artifact_base_str), fs::path(out_dir));
+      jobs = load_wav_list_jobs(wav_list_path, fs::path(out_dir));
     } else {
-      const std::string clu_path = get_arg(argc, argv, "--clusters");
-      const std::string map_path = get_arg(argc, argv, "--label-mapping");
       const std::string out_path = get_arg(argc, argv, "--out");
-      if (wav_path.empty() || onnx_path.empty() || rf_path.empty() || map_path.empty() || out_path.empty()) {
-        throw std::runtime_error("missing required argument (see --help)");
-      }
-      if (!vbx_cli && clu_path.empty()) {
-        throw std::runtime_error("missing --clusters (or pass --embedding-onnx, --xvec-transform, --plda)");
+      if (wav_path.empty() || out_path.empty()) {
+        throw std::runtime_error("missing --wav or --out (see --help)");
       }
       if (!out_dir.empty()) {
         throw std::runtime_error("--out-dir is only for --manifest or --wav-list batch mode");
       }
-      jobs.push_back({wav_path, clu_path, map_path, "", out_path});
+      jobs.push_back({wav_path, "", out_path});
     }
 
     if (onnx_path.empty() || rf_path.empty()) {
       throw std::runtime_error("missing --segmentation-onnx or --receptive-field");
     }
 
-    pyannote::Pyannote engine(
+    pyannote::CppAnnote engine(
         onnx_path,
         rf_path,
-        vbx_cli ? std::string() : jobs[0].clusters,
-        jobs[0].label_mapping,
         global_bounds,
         snap,
         embed_onnx,
@@ -243,7 +218,11 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < jobs.size(); ++i) {
       try {
         const DiarJob& job = jobs[i];
-        engine.set_utterance_paths(job.clusters, job.label_mapping, job.golden_bounds);
+        if (!job.golden_bounds.empty()) {
+          engine.set_golden_speaker_bounds(job.golden_bounds);
+        } else {
+          engine.set_golden_speaker_bounds("");
+        }
 
         int wav_sr = 0;
         std::vector<float> mono = wav_pcm::load_wav_pcm16_mono_float32(job.wav, wav_sr);

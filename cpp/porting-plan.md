@@ -22,7 +22,7 @@ ONNX export for the C++ port lives under **`cpp/scripts/`**:
 | `reconstruct_golden_test` (C++) | `reconstruct` (per-chunk max over cluster members) + `to_diarization` (`Inference.aggregate` `skip_average=True`, extent crop, top-`count` speakers) vs **`discrete_diarization_overlap.npz`** / **`discrete_diarization_exclusive.npz`**. |
 | `annotation_golden_test` (C++) | `Binarize` / `to_annotation` (onset/offset 0.5, frame middles) + **`label_mapping.json`** vs **`diarization.json`** / **`exclusive_diarization.json`**. |
 | `dump_diarization_golden.py` | Full **`SpeakerDiarization.apply()`** control flow; writes NPZ/JSON bundles for C++ parity (see §11). |
-| `community1_shortpath` (C++) | **WAV** + full-chunk segmentation ORT + oracle **`hard_clusters_final.npz`** → **`diarization.json`** (no VBx). |
+| `cpp-annote-cli` (C++) | **WAV** + segmentation ORT + ORT embedding + VBx (PLDA) → **`diarization.json`**. |
 | `fetch_callhome_example_wav.py` | Saves one clip from **`diarizers-community/callhome`** (split **`data`** in current HF revision) for **`dump_golden.sh`**. |
 
 Install extras: `pip install -e ".[export]"` (see `pyproject.toml`). Requires Hugging Face access to the gated model; set **`HF_TOKEN`** in the environment.
@@ -210,7 +210,7 @@ Use **`cpp/scripts/dump_diarization_golden.py`** (or **`scripts/dump_golden.sh`*
 | After `reconstruct` / `to_annotation` | `discrete_diarization_*.npz`, `diarization.json`, **`label_mapping.json`** | **`reconstruct_golden_test`** + **`annotation_golden_test`** |
 | Root | `manifest.json`, `pipeline_snapshot.json`, `receptive_field.json` | Versions and hyperparameters |
 
-For closing the **embedding + VBx** gap vs Python in `--cpp-mode full` (logging, ordered tests, milestones), see **`cpp/embedding-vbx-parity-plan.md`**. Milestone 0 (frozen NPZ layout) is enforced by **`cpp/build/frozen_golden_inputs_test`**.
+For closing the **embedding + VBx** gap vs Python in the C++ diarization path (logging, ordered tests, milestones), see **`cpp/embedding-vbx-parity-plan.md`**. Milestone 0 (frozen NPZ layout) is enforced by **`cpp/build/frozen_golden_inputs_test`**.
 
 ---
 
@@ -243,4 +243,4 @@ Document in `DiarizationConfig` (single source for C++ and test generators):
 | 2026-04-14 | **`reconstruct_golden_test`**: C++ parity for `reconstruct` + `to_diarization` vs discrete diarization NPZs. |
 | 2026-04-14 | **`annotation_golden_test`**: `Binarize` / `to_annotation` vs golden diarization JSON (+ label mapping). |
 | 2026-04-14 | **`cpp/port/annotation_support.hpp`**: `Timeline.support` + `Annotation.support` (collar merge + second pass) for `min_duration_off` / golden parity. |
-| 2026-04-14 | **`community1_shortpath`**: WAV + sliding segmentation ORT + oracle clusters → JSON; **`wav_pcm_float32.hpp`**; export JSON gains **`chunk_step_sec`**. |
+| 2026-04-14 | **`cpp-annote-cli`**: WAV + sliding segmentation ORT + VBx clustering → JSON; **`wav_pcm_float32.hpp`**; export JSON gains **`chunk_step_sec`**. |

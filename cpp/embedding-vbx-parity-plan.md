@@ -1,6 +1,6 @@
 # Embedding and VBx parity vs Python
 
-This document captures how the C++ **full** diarization path (`--cpp-mode full`: ORT embeddings + ported VBx) can diverge from Python (Torch embeddings + `VBxClustering`), and a **staged plan** to close the gap using **logging and tests at every boundary**.
+This document captures how the C++ diarization path in **`cpp-annote-cli`** (ORT embeddings + ported VBx) can diverge from Python (Torch embeddings + `VBxClustering`), and a **staged plan** to close the gap using **logging and tests at every boundary**.
 
 Related: `cpp/porting-plan.md` (Section 11, golden artifact layout), `cpp/scripts/dump_diarization_golden.py`, `cpp/scripts/write_vbx_golden_reference.py`, `cpp/scripts/trace_diarization_parity.py`.
 
@@ -14,7 +14,7 @@ Related: `cpp/porting-plan.md` (Section 11, golden artifact layout), `cpp/script
 2. **VBx stack (even on identical embeddings)**  
    `clustering_golden_test` loads Python `embeddings.npz` and compares C++ `hard_clusters` to golden `clustering.npz` with a **relaxed** threshold (`mismatch_frac > 0.35` fails). That reflects known non–bit-identical behavior (SciPy/sklearn vs Eigen + Hungarian + `scipy_linkage` port, ELBO early stop, ties).
 
-**Implication:** large DER differences in `--cpp-mode full` vs Python are expected until both gaps are addressed. Rebuilding alone does not make full mode match Python.
+**Implication:** large DER differences in C++ **cpp-annote-cli** vs Python are expected until both gaps are addressed. Rebuilding alone does not make the C++ path match Python.
 
 ---
 
@@ -36,7 +36,7 @@ Related: `cpp/porting-plan.md` (Section 11, golden artifact layout), `cpp/script
 - **Single-speaker mask:** Python uses `np.sum(segmentations.data, axis=2, keepdims=True) == 1`. C++ uses `|row_sum - 1| < 1e-3`. Equivalent for strict binary masks; log and compare `clean` counts if segmentations are ever soft.
 - **VBx iteration count:** ELBO early stop can differ → different `gamma` → different centroids → different hard labels.
 - **Hungarian:** multiple optimal assignments on ties → different `hard_clusters` with identical soft scores.
-- **Forced cluster count:** Python `KMeans(..., random_state=42)` vs C++ `kmeans_fit_predict(..., seed=42)` when `num_clusters` / bounds force relabeling; ensure `VbxClusteringParams` in `pyannote.cpp` match the resolved pipeline config from the golden `pipeline_snapshot.json` / HF `config.yaml`.
+- **Forced cluster count:** Python `KMeans(..., random_state=42)` vs C++ `kmeans_fit_predict(..., seed=42)` when `num_clusters` / bounds force relabeling; ensure `VbxClusteringParams` in `cpp-annote.cpp` match the resolved pipeline config from the golden `pipeline_snapshot.json` / HF `config.yaml`.
 
 ---
 
@@ -50,7 +50,7 @@ Related: `cpp/porting-plan.md` (Section 11, golden artifact layout), `cpp/script
 | `PYANNOTE_CPP_PARITY=1` | Light: one line after ORT embeddings, one after VBx (or skip line if `T < 2`). |
 | `PYANNOTE_CPP_PARITY=2` | Heavy: writes `vbx_parity_dump.npz` under `PYANNOTE_CPP_PARITY_OUT` (requires that directory). |
 
-Implementation: `cpp/port/parity_log.hpp`, `parity_log.cpp`; hooks in `pyannote.cpp` (embeddings) and `clustering_vbx.cpp` (VBx + dump).
+Implementation: `cpp/port/parity_log.hpp`, `parity_log.cpp`; hooks in `cpp-annote.cpp` (embeddings) and `clustering_vbx.cpp` (VBx + dump).
 
 `PYANNOTE_CPP_DIAG=1` remains separate (chunking / ORT shape only).
 
@@ -97,7 +97,7 @@ One fixed golden utterance directory (e.g. from `dump_diarization_golden.py` or 
 ### Milestone 1 — Embedding parity (Torch vs ORT)
 
 - **Chunk 0 / spk 0:** `cpp/tests/embedding_golden_test.cpp` (ORT vs `embedding_chunk0_spk0_ort.npz` from the dump).  
-- **Full tensor:** same binary, mode `--all`: recomputes ORT embeddings for every chunk and local speaker using the same fbank + **segmentation-length** `weights` tensor as `Pyannote::diarize` (`embedding_ort_infer.cpp` + `compute_fbank.cpp`), WAV + golden `binarized_segmentations.npz`, parent `pipeline_snapshot.json` for `embedding_exclude_overlap`, and compares to `embeddings.npz`.
+- **Full tensor:** same binary, mode `--all`: recomputes ORT embeddings for every chunk and local speaker using the same fbank + **segmentation-length** `weights` tensor as `CppAnnote::diarize` (`embedding_ort_infer.cpp` + `compute_fbank.cpp`), WAV + golden `binarized_segmentations.npz`, parent `pipeline_snapshot.json` for `embedding_exclude_overlap`, and compares to `embeddings.npz`.
 
 Printed stats: slot counts (`both_finite`, `gold_finite_ort_nan`, …), mean of per-slot max-abs-diff over **mutually finite** rows, worst `(c,s)`, global max abs diff, `allclose` fail fraction (same `rtol`/`atol` as chunk-0 mode).
 
@@ -108,7 +108,7 @@ Printed stats: slot counts (`both_finite`, `gold_finite_ort_nan`, …), mean of 
 | `EMBEDDING_FULL_MAX_OR_NAN_SLOTS` | `200` | Max slots where golden row is finite but ORT is all-NaN (should stay `0` once weights-length parity holds). Use `0` to fail on any such slot. |
 | `EMBEDDING_FULL_MAX_FAIL_FRAC` | `0.10` | Max fraction of mutually-finite slots that violate `allclose(rtol=1e-2, atol=1e-3)`. |
 
-Shared ORT helpers live in **`cpp/port/embedding_ort_infer.hpp`** / **`embedding_ort_infer.cpp`** (also used by `community1_shortpath` / `pyannote.cpp`).
+Shared ORT helpers live in **`cpp/port/embedding_ort_infer.hpp`** / **`embedding_ort_infer.cpp`** (also used by `cpp-annote-cli` / `cpp-annote.cpp`).
 
 #### Investigating Torch-finite / ORT-NaN slots
 
@@ -116,7 +116,7 @@ Shared ORT helpers live in **`cpp/port/embedding_ort_infer.hpp`** / **`embedding
 
 C++ had been **upsampling** the mask to **`Tf`** with a non-PyTorch grid, then **gating** on **`n_keep < min_num_frames`** and skipping ORT like **`ONNXWeSpeakerPretrainedSpeakerEmbedding.__call__`** (strip short masked fbank, leave NaN). That **does not** match the golden tensor when a speaker has **no active segmentation frames** (`n_active_seg = 0`): Torch still returns a **finite** pooled vector; ORT with **all-zero segmentation `weights`** also returns **finite** (verified).
 
-**Fix (in `Pyannote::diarize` and `embedding_golden_test --all`):** pass **`src`** (length **`F`**, clean vs full per `min_nf_seg`) directly to **`run_embedding_ort`**; remove the **`min_num_frames`** skip. **`seg_to_fbank_nearest_index`** is now only a helper (PyTorch/OpenCV-BC `nearest_neighbor_compute_source_index`); it is **not** used on the ORT path anymore.
+**Fix (in `CppAnnote::diarize` and `embedding_golden_test --all`):** pass **`src`** (length **`F`**, clean vs full per `min_nf_seg`) directly to **`run_embedding_ort`**; remove the **`min_num_frames`** skip. **`seg_to_fbank_nearest_index`** is now only a helper (PyTorch/OpenCV-BC `nearest_neighbor_compute_source_index`); it is **not** used on the ORT path anymore.
 
 **Tools:**
 
@@ -142,13 +142,13 @@ Golden dir: ``.callhome_eval_work/golden/callhome_eng_data_idx3_head120s/`` (sam
 |------------|--------------------|--------|
 | DER ref vs ``diarization.json`` (Python dump) | ``pyannote.metrics.DiarizationErrorRate`` on HF ref vs golden JSON | **29.64%** |
 | DER ref vs existing C++ full JSON | same vs ``.callhome_eval_work/cpp_out/callhome_eng_data_idx3_head120s.json`` | **48.08%** |
-| DER ref vs C++ **oracle** (golden ``hard_clusters_final.npz``) | ``community1_shortpath`` single-file with ``--clusters`` + golden maps | **29.64%** (matches Python golden to reported precision) |
+| DER ref vs reconstruct using **golden** ``hard_clusters_final.npz`` | ``reconstruct_golden_test`` / same reconstruct as Python dump | **29.64%** (matches Python golden to reported precision; not ``cpp-annote-cli``, which always runs VBx) |
 | Full-window segmentation ORT vs golden | ``full_segmentation_window_parity_test`` … onnx … golden … wav | **PASS** — ``max_abs_diff = 0``, **0** binarized bit mismatches |
 | First-chunk segmentation | ``segmentation_golden_test`` | **PASS** — ``max_abs_diff(first_chunk) = 0`` |
 | Embedding ORT vs ``embeddings.npz`` | ``embedding_golden_test`` … ``--all`` … | **PASS** — ``gold_finite_ort_nan=0``, ``allclose_fail_slots=0``, mean per-slot max-abs **~2.6e-6** |
 | VBx vs golden ``clustering.npz`` | ``clustering_golden_test`` on golden dir + HF ``xvec_transform.npz`` / ``plda.npz`` | **FAIL** — ``mismatch_frac ≈ 0.56`` (uses **golden** embeddings + binarized; compares C++ ``hard_clusters`` to Python ``clustering.npz``) |
 
-**Conclusion:** Segmentation and ORT embeddings **match** the dumped Python tensors for this utterance. Oracle reconstruction reproduces the **same DER** as the golden diarization. The **~18.4 pt DER lift** is therefore from **C++ VBx / AHC vs Python’s VBxClustering** (and downstream relabeling), not from waveform, segmentation ONNX, or embedding ONNX vs Torch golden.
+**Conclusion:** Segmentation and ORT embeddings **match** the dumped Python tensors for this utterance. Reconstruction with Python’s golden ``hard_clusters`` reproduces the **same DER** as the golden diarization. The **~18.4 pt DER lift** on **cpp-annote-cli** output is therefore from **C++ VBx / AHC vs Python’s VBxClustering** (and downstream relabeling), not from waveform, segmentation ONNX, or embedding ONNX vs Torch golden.
 
 **Next steps (Milestones 3–5):** align ``clustering_vbx`` with SciPy linkage / ``fcluster``, PLDA application, and VBx iterations (see traces in ``write_vbx_golden_reference.py``); ``clustering_golden_test`` already encodes the current acceptance gate (``mismatch_frac <= 0.35``) and fails on idx3 for the same reason as idx0 in a strict run.
 
@@ -209,7 +209,7 @@ Tighten `clustering_golden_test` from the current ~35% mismatch cap toward **exa
 
 ### Milestone 9 — Full pipeline
 
-`eval_callhome_cpp_vs_python.py --cpp-mode full`: DER should track Python only after Milestones **1** and **8** are acceptable for your product bar.
+`eval_callhome_cpp_vs_python.py` (C++ column uses **cpp-annote-cli**): DER should track Python only after Milestones **1** and **8** are acceptable for your product bar.
 
 ---
 

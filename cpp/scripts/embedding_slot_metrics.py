@@ -3,7 +3,7 @@
 """Cross-check ``embedding_golden_test`` CSV rows vs golden ``binarized_segmentations.npz``.
 
 Recomputes ``sum_clean``, ``prefer_clean``, ``n_active_seg`` using the same rules as C++
-(``pyannote.cpp`` / ``embedding_golden_test --all``): overlap mask, ``> 0.5`` counts on the
+(``cpp-annote.cpp`` / ``embedding_golden_test --all``): overlap mask, ``> 0.5`` counts on the
 used segmentation mask, and ``min_nf_seg`` from the CSV column.
 
 Usage:

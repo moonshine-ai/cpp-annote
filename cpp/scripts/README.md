@@ -60,10 +60,11 @@ python cpp/scripts/add_first_chunk_waveform.py cpp/golden/<run>/<utterance_dir> 
 
 ### CallHome: Python vs C++ DER on the first *n* clips
 
-`eval_callhome_cpp_vs_python.py` downloads the first **n** rows from the English CallHome split (config `eng`, split `data` by default), truncates each to `--max-seconds`, runs `dump_diarization_golden.py` once to produce oracle `hard_clusters_final.npz` per clip, runs `community1_shortpath` in batch, then reports **Diarization Error Rate** (`pyannote.metrics`) against the dataset’s timestamp/speaker reference for both the full Python pipeline and the C++ short path (oracle clusters from that dump).
+`eval_callhome_cpp_vs_python.py` downloads the first **n** rows from the English CallHome split (config `eng`, split `data` by default), truncates each to `--max-seconds`, runs `dump_diarization_golden.py` once for receptive field / pipeline snapshot / optional per-clip `golden_speaker_bounds.json`, runs `cpp-annote-cli` in batch (ORT segmentation + ORT embedding + VBx in C++), then reports **Diarization Error Rate** (`pyannote.metrics`) against the dataset’s timestamp/speaker reference for both the full Python pipeline and the C++ path.
 
 ```bash
-# From repo root; needs HF_TOKEN, datasets, torchaudio, built cpp/build/community1_shortpath, cpp/artifacts/community1-segmentation.onnx
+# From repo root; needs HF_TOKEN, datasets, torchaudio, built cpp/build/cpp-annote-cli,
+# cpp/artifacts/community1-segmentation.onnx and cpp/artifacts/community1-embedding.onnx (or pass --cpp-embedding-onnx).
 uv run python cpp/scripts/eval_callhome_cpp_vs_python.py -n 20 --work-dir .callhome_eval_work
 ```
 

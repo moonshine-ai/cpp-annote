@@ -10,8 +10,8 @@ Minimal **CMake** project that links **ONNX Runtime** + **cnpy** and runs:
 - **`frozen_golden_inputs_test`** — Milestone 0: asserts required keys, shapes, and dtypes in the frozen CallHome golden utterance NPZs (and sibling `receptive_field.json`, etc.); **cnpy** only
 - **`reconstruct_golden_test`** — `reconstruct` + `to_diarization` vs `discrete_diarization_overlap.npz` and `discrete_diarization_exclusive.npz` (**cnpy** only)
 - **`annotation_golden_test`** — `Binarize` / `to_annotation` vs `diarization.json` and `exclusive_diarization.json` (uses **`label_mapping.json`**; **cnpy** only)
-- **`community1_shortpath`** — **WAV → full-chunk segmentation ORT → speaker count → reconstruct → JSON** using **oracle** `hard_clusters_final.npz` from a Python golden dump (same audio length / chunk count as that dump). No VBx, PLDA, or embeddings.
-- **`pyannote::Pyannote`** (`port/pyannote.hpp`, `port/pyannote.cpp`) — same pipeline as **`community1_shortpath`**, exposed as a class: construct with paths to ONNX, receptive field, oracle clusters, label mapping, optional speaker bounds, optional pipeline snapshot; call **`diarize(std::vector<float> mono, std::int32_t sample_rate)`** to obtain **`std::vector<pyannote::DiarizationTurn>`** (use **`pyannote::write_diarization_json`** to serialize like the CLI).
+- **`cpp-annote-cli`** — **WAV → segmentation ORT → ORT embeddings → VBx (PLDA) → speaker count → reconstruct → JSON**. Cluster assignments are computed in C++ (no `hard_clusters_final.npz` from a golden dump).
+- **`pyannote::CppAnnote`** (`port/pyannote.hpp`, `port/cpp-annote.cpp`) — same pipeline as **`cpp-annote-cli`**, exposed as a class: construct with segmentation ONNX, receptive field, optional default `golden_speaker_bounds.json`, optional `pipeline_snapshot.json`, plus **embedding ONNX**, **xvec transform NPZ**, and **PLDA NPZ**; call **`diarize(std::vector<float> mono, std::int32_t sample_rate)`** to obtain **`std::vector<pyannote::DiarizationTurn>`** (use **`pyannote::write_diarization_json`** to serialize like the CLI). Output speakers are labeled **`SPEAKER_00`**, **`SPEAKER_01`**, … unless you extend the code to load a name map.
 
 ## 1. Install ONNX Runtime (C/C++ prebuilt)
 
@@ -130,31 +130,32 @@ Requires **`segmentations.npz`**, **`hard_clusters_final.npz`**, **`speaker_coun
 
 Compares hysteresis (**onset/offset 0.5**, frame middles) on **`discrete_diarization_*.npz`** to **`diarization.json`** / **`exclusive_diarization.json`**, after **`label_mapping.json`** (same as the Python `rename_labels` step). Non-zero **`segmentation.min_duration_off`** in **`../pipeline_snapshot.json`** triggers the same **`Annotation.support(collar=...)`** merge as Python (see **`cpp/port/annotation_support.hpp`**). Non-zero **`min_duration_on`** drops short segments after that step. **`min_duration_off`** / pad branches match `Binarize.__call__`: the support pass runs only when **`min_duration_off > 0`** or pad is non-zero (Callhome bundle uses **0.0** / no pad).
 
-### 9. Short path: WAV + oracle clusters → `diarization.json`
+### 9. Short path: WAV + VBx → `diarization.json`
 
-Use the **same** WAV file (and thus the same number of segmentation chunks) as the Python golden dump that produced **`hard_clusters_final.npz`**. The tool reads **PCM 16-bit LE** WAV, resamples linearly to the segmentation model rate from the ONNX sidecar JSON (typically **16 kHz** mono downmix).
+The tool reads **PCM 16-bit LE** WAV, resamples to the segmentation model rate from the ONNX sidecar JSON (typically **16 kHz** mono downmix), runs **embedding ORT** on each chunk/local speaker, then **VBx** to produce `hard_clusters` in memory before reconstruct.
 
 ```bash
-./cpp/build/community1_shortpath \
-  --wav /path/to/same_audio_as_golden.wav \
+./cpp/build/cpp-annote-cli \
+  --wav /path/to/audio.wav \
   --segmentation-onnx cpp/artifacts/community1-segmentation.onnx \
   --receptive-field cpp/golden/my_run/receptive_field.json \
-  --clusters cpp/golden/my_run/utterance_dir/hard_clusters_final.npz \
-  --label-mapping cpp/golden/my_run/utterance_dir/label_mapping.json \
-  --golden-speaker-bounds cpp/golden/my_run/utterance_dir/golden_speaker_bounds.json \
   --pipeline-snapshot cpp/golden/my_run/pipeline_snapshot.json \
+  --embedding-onnx cpp/artifacts/community1-embedding.onnx \
+  --xvec-transform /path/to/xvec_transform.npz \
+  --plda /path/to/plda.npz \
+  --golden-speaker-bounds cpp/golden/my_run/utterance_dir/golden_speaker_bounds.json \
   --out /tmp/diarization_cpp.json
 ```
 
-**`--golden-speaker-bounds`** and **`--pipeline-snapshot`** are optional; omit bounds to assume no `max_speakers` cap (`inf`). This build expects **`export_includes_powerset_to_multilabel: true`** (community-1 default export). There is **no** embedding / VBx / PLDA: clustering must be supplied out-of-band (oracle). If the segmentation model assigns **no** active speech (speaker count all zero), the tool writes an **empty** JSON array (same idea as Python early exit).
+**`--golden-speaker-bounds`** and **`--pipeline-snapshot`** are optional; omit bounds to assume no `max_speakers` cap (`inf`). This build expects **`export_includes_powerset_to_multilabel: true`** (community-1 default export). If the segmentation model assigns **no** active speech (speaker count all zero), the tool writes an **empty** JSON array.
 
-**Batch (same ONNX / receptive field / snapshot for every job):**
+**Batch (same ONNX / receptive field / snapshot / embedding / PLDA for every job):**
 
-- **`--manifest FILE`** — tab-separated lines (lines starting with `#` are ignored). Use **paths relative to your cwd** (or absolute).
-  - **3 columns:** `wav<TAB>clusters.npz<TAB>label_mapping.json` — also pass **`--out-dir DIR`**; each job writes `DIR/<wav_basename_without_suffix>.json`.
-  - **4 columns:** `wav<TAB>clusters<TAB>label_mapping<TAB>out.json`
-  - **5 columns:** `wav<TAB>clusters<TAB>label_mapping<TAB>golden_speaker_bounds.json<TAB>out.json`
-- **`--wav-list FILE`** plus **`--artifact-base BASE`** and **`--out-dir OUT`** — one WAV path per line; artifacts are read from `BASE/<stem(wav)>/hard_clusters_final.npz`, `label_mapping.json`, and `golden_speaker_bounds.json` if present; outputs are `OUT/<stem(wav)>.json`.
-- **`--continue-on-error`** — in batch mode, log each failure and keep going; exit status **1** if any job failed.
+- **`--manifest FILE`** — tab-separated lines (`#` comments OK). Paths relative to cwd or absolute.
+  - **1 column:** `wav` — requires **`--out-dir DIR`**; each job writes `DIR/<wav_stem>.json`.
+  - **2 columns:** `wav<TAB>out.json`
+  - **3 columns:** `wav<TAB>golden_speaker_bounds.json<TAB>out.json`
+- **`--wav-list FILE`** plus **`--out-dir OUT`** — one WAV path per line; outputs are `OUT/<stem>.json`.
+- **`--continue-on-error`** — in batch mode, log each failure and keep going; exit **1** if any job failed.
 
-The binary loads the ONNX session once and reuses it across jobs.
+The binary loads the segmentation and embedding ONNX sessions once and reuses them across jobs.

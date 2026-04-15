@@ -183,9 +183,9 @@ target_include_directories(filter_ahc_golden_test PRIVATE "${CMAKE_CURRENT_SOURC
 target_link_libraries(filter_ahc_golden_test PRIVATE cnpy_static eigen_mpl2)
 
 add_executable(
-  community1_shortpath
-  tools/community1_shortpath.cpp
-  port/pyannote.cpp
+  cpp-annote-cli
+  tools/cpp-annote-cli.cpp
+  port/cpp-annote.cpp
   port/compute_fbank.cpp
   port/embedding_ort_infer.cpp
   port/filter_train.cpp
@@ -194,15 +194,15 @@ add_executable(
   port/scipy_linkage.cpp
   port/parity_log.cpp
 )
-target_include_directories(community1_shortpath PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
-target_include_directories(community1_shortpath PRIVATE "${ORT_INCLUDE_DIR}")
-target_link_libraries(community1_shortpath PRIVATE cnpy_static "${ORT_LIBRARY}" eigen_mpl2)
+target_include_directories(cpp-annote-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(cpp-annote-cli PRIVATE "${ORT_INCLUDE_DIR}")
+target_link_libraries(cpp-annote-cli PRIVATE cnpy_static "${ORT_LIBRARY}" eigen_mpl2)
 if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
-  target_include_directories(community1_shortpath PRIVATE "${kaldi_native_fbank_SOURCE_DIR}")
-  target_link_libraries(community1_shortpath PRIVATE kaldi-native-fbank-core)
+  target_include_directories(cpp-annote-cli PRIVATE "${kaldi_native_fbank_SOURCE_DIR}")
+  target_link_libraries(cpp-annote-cli PRIVATE kaldi-native-fbank-core)
 endif()
 if(APPLE)
-  target_link_libraries(community1_shortpath PRIVATE "-framework Foundation")
+  target_link_libraries(cpp-annote-cli PRIVATE "-framework Foundation")
 endif()
 
 if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)

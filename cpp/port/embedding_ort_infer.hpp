@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// ONNX embedding runtime helpers shared by ``pyannote.cpp`` and ``embedding_golden_test``.
+// ONNX embedding runtime helpers shared by ``cpp-annote.cpp`` and ``embedding_golden_test``.
 
 #pragma once
 

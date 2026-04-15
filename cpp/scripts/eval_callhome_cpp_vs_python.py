@@ -6,12 +6,10 @@
 # Evaluate Diarization Error Rate (DER) on the first n clips from Hugging Face
 # ``diarizers-community/callhome`` (English subset by default): reference labels
 # from dataset timestamps vs (1) full ``SpeakerDiarization`` in Python and
-# (2) C++ ``community1_shortpath`` either with oracle clusters from a golden dump.
+# (2) C++ ``cpp-annote-cli`` (segmentation ORT + ORT embedding + VBx in C++).
 # By default we evaluate the **NIST-style Part 2** slice (see ``--callhome-part``):
 # for 140-row configs that is HF rows 80–139 (Part 1 is 0–79); for 120-row configs,
 # Part 2 is rows 60–119 (Part 1 is 0–59).
-# (``--cpp-mode oracle``) or the full C++ stack including ORT embedding + VBx
-# (``--cpp-mode full``, no ``hard_clusters_final.npz``).
 
 from __future__ import annotations
 
@@ -136,8 +134,8 @@ def _json_diarization_to_annotation(path: Path, uri: str) -> Any:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "DER on first n CallHome (HF) clips: Python community-1 pipeline vs C++ shortpath "
-            "(oracle clusters or full C++ VBx; see --cpp-mode). "
+            "DER on first n CallHome (HF) clips: Python community-1 pipeline vs C++ cpp-annote-cli "
+            "(ORT segmentation + ORT embedding + VBx). "
             "Defaults to NIST-style Part 2 rows (``--callhome-part 2``); use ``--callhome-part 1`` or "
             "``--start-index`` to change the slice."
         )
@@ -203,8 +201,8 @@ def main() -> None:
     ap.add_argument(
         "--cpp-binary",
         type=Path,
-        default=_REPO_ROOT / "cpp" / "build" / "community1_shortpath",
-        help="Path to community1_shortpath executable",
+        default=_REPO_ROOT / "cpp" / "build" / "cpp-annote-cli",
+        help="Path to cpp-annote-cli executable",
     )
     ap.add_argument(
         "--segmentation-onnx",
@@ -213,28 +211,22 @@ def main() -> None:
         help="Segmentation ONNX for the C++ short path",
     )
     ap.add_argument(
-        "--cpp-mode",
-        choices=("oracle", "full"),
-        default="oracle",
-        help="oracle: C++ uses golden hard_clusters (default). full: VBx + ORT embedding, no oracle NPZ.",
-    )
-    ap.add_argument(
         "--cpp-embedding-onnx",
         type=Path,
         default=_REPO_ROOT / "cpp" / "artifacts" / "community1-embedding.onnx",
-        help="Used when --cpp-mode full",
+        help="Embedding ONNX passed to cpp-annote-cli",
     )
     ap.add_argument(
         "--cpp-xvec",
         type=Path,
         default=None,
-        help="xvec_transform.npz for full C++ mode (default: download from --checkpoint)",
+        help="xvec_transform.npz (default: download from --checkpoint)",
     )
     ap.add_argument(
         "--cpp-plda",
         type=Path,
         default=None,
-        help="plda.npz for full C++ mode (default: download from --checkpoint)",
+        help="plda.npz (default: download from --checkpoint)",
     )
     ap.add_argument("--skip-cpp", action="store_true", help="Skip C++ binary; only Python DER + golden dump")
     ap.add_argument(
@@ -246,7 +238,7 @@ def main() -> None:
         "--cpp-clustering-check",
         action="store_true",
         help=(
-            "After C++ batch in --cpp-mode full, run clustering_golden_test on the first utterance only "
+            "After C++ batch, run clustering_golden_test on the first utterance only "
             "(requires cpp/build/clustering_golden_test and golden NPZ from the dump)."
         ),
     )
@@ -254,17 +246,6 @@ def main() -> None:
 
     if args.num_files < 1:
         raise SystemExit("--num-files must be >= 1")
-
-    if args.cpp_mode == "full":
-        print(
-            "Note (--cpp-mode full): the C++ column runs ORT embeddings + the ported VBx stack in C++; "
-            "the Python column runs Torch embeddings + pyannote's clustering (SciPy/NumPy numerics). "
-            "Those stages are not bit-identical, so ``hard_clusters`` and DER often differ a lot from "
-            "Python even when segmentation and the eval WAV match the golden dump. "
-            "Use ``--cpp-mode oracle`` to check end-to-end parity against the dumped pipeline "
-            "(oracle ``hard_clusters_final.npz`` + same reconstruct path).",
-            flush=True,
-        )
 
     try:
         from datasets import load_dataset
@@ -356,17 +337,21 @@ def main() -> None:
             if not p.is_file():
                 raise SystemExit(f"Missing required file for C++: {p}")
 
-        list_file = work / "wav_list.txt"
-        list_file.write_text("\n".join(str(p) for p in wav_paths) + "\n", encoding="utf-8")
+        manifest_path = work / "cpp_diar_manifest.tsv"
+        man_lines: list[str] = []
+        for wav_path, stem in zip(wav_paths, stems, strict=True):
+            out_json = cpp_out / f"{stem}.json"
+            gb = golden_root / stem / "golden_speaker_bounds.json"
+            if gb.is_file():
+                man_lines.append(f"{wav_path}\t{gb}\t{out_json}")
+            else:
+                man_lines.append(f"{wav_path}\t\t{out_json}")
+        manifest_path.write_text("\n".join(man_lines) + "\n", encoding="utf-8")
 
         cmd_cpp = [
             str(cpp_bin),
-            "--wav-list",
-            str(list_file),
-            "--artifact-base",
-            str(golden_root),
-            "--out-dir",
-            str(cpp_out),
+            "--manifest",
+            str(manifest_path),
             "--segmentation-onnx",
             str(onnx),
             "--receptive-field",
@@ -374,35 +359,31 @@ def main() -> None:
             "--pipeline-snapshot",
             str(snap_json),
         ]
-        xvec_resolved: Path | None = None
-        plda_resolved: Path | None = None
-        if args.cpp_mode == "full":
-            emb_onnx = args.cpp_embedding_onnx.resolve()
-            if not emb_onnx.is_file():
-                raise SystemExit(f"--cpp-mode full requires embedding ONNX: {emb_onnx}")
-            if args.cpp_xvec is not None and args.cpp_plda is not None:
-                xv = args.cpp_xvec.resolve()
-                pl = args.cpp_plda.resolve()
-            else:
-                xv, pl = _hf_embedding_plda_paths(args.checkpoint, args.revision, token)
-            xvec_resolved = xv
-            plda_resolved = pl
-            cmd_cpp.extend(
-                [
-                    "--embedding-onnx",
-                    str(emb_onnx),
-                    "--xvec-transform",
-                    str(xv),
-                    "--plda",
-                    str(pl),
-                ]
-            )
-        print("Running C++ batch:", cpp_bin.name, f"(cpp_mode={args.cpp_mode})", flush=True)
+        emb_onnx = args.cpp_embedding_onnx.resolve()
+        if not emb_onnx.is_file():
+            raise SystemExit(f"C++ eval requires embedding ONNX: {emb_onnx}")
+        if args.cpp_xvec is not None and args.cpp_plda is not None:
+            xv = args.cpp_xvec.resolve()
+            pl = args.cpp_plda.resolve()
+        else:
+            xv, pl = _hf_embedding_plda_paths(args.checkpoint, args.revision, token)
+        xvec_resolved = xv
+        plda_resolved = pl
+        cmd_cpp.extend(
+            [
+                "--embedding-onnx",
+                str(emb_onnx),
+                "--xvec-transform",
+                str(xv),
+                "--plda",
+                str(pl),
+            ]
+        )
+        print("Running C++ batch:", cpp_bin.name, flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
 
         if (
-            args.cpp_mode == "full"
-            and args.cpp_clustering_check
+            args.cpp_clustering_check
             and stems
             and xvec_resolved is not None
             and plda_resolved is not None
@@ -489,12 +470,9 @@ def main() -> None:
     print()
     print("Reference: HF ``timestamps_*`` / ``speakers`` clipped to truncated WAV length.")
     print("Python: full SpeakerDiarization output on each WAV.")
-    if args.cpp_mode == "oracle":
-        print("C++: community1_shortpath with oracle hard_clusters from the golden dump (same checkpoint).")
-    else:
-        print(
-            "C++: community1_shortpath full pipeline (segmentation + ORT embedding + VBx; no oracle clusters NPZ)."
-        )
+    print(
+        "C++: cpp-annote-cli (segmentation ORT + ORT embedding + VBx; clusters computed in C++, not from NPZ)."
+    )
 
 
 if __name__ == "__main__":

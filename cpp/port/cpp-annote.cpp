@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <climits>
 #include <map>
@@ -23,7 +24,6 @@
 #include "clustering_vbx.hpp"
 #include "compute_fbank.hpp"
 #include "embedding_ort_infer.hpp"
-#include "cnpy.h"
 #include "parity_log.hpp"
 #include "plda_vbx.hpp"
 #include "wav_pcm_float32.hpp"
@@ -487,15 +487,6 @@ void binarize_column(
   }
 }
 
-std::map<int, std::string> parse_label_mapping(const std::string& json) {
-  std::map<int, std::string> m;
-  std::regex re("\"([0-9]+)\"\\s*:\\s*\"([^\"]*)\"");
-  for (std::sregex_iterator it(json.begin(), json.end(), re), end; it != end; ++it) {
-    m[std::stoi((*it)[1].str())] = (*it)[2].str();
-  }
-  return m;
-}
-
 bool try_regex_double(const std::string& json, const std::string& key_esc, double& out) {
   const std::string pat = "\"" + key_esc + "\"\\s*:\\s*([-+0-9.eE]+)";
   std::regex re(pat);
@@ -569,11 +560,9 @@ void write_diarization_json(const std::string& path, const std::vector<Diarizati
   f << "]\n";
 }
 
-Pyannote::Pyannote(
+CppAnnote::CppAnnote(
     std::string segmentation_onnx_path,
     std::string receptive_field_json_path,
-    std::string clusters_npz_path,
-    std::string label_mapping_json_path,
     std::string golden_speaker_bounds_json_path,
     std::string pipeline_snapshot_json_path,
     std::string embedding_onnx_path,
@@ -581,8 +570,6 @@ Pyannote::Pyannote(
     std::string plda_npz_path)
     : onnx_path_(std::move(segmentation_onnx_path)),
       receptive_field_path_(std::move(receptive_field_json_path)),
-      clusters_path_(std::move(clusters_npz_path)),
-      label_mapping_path_(std::move(label_mapping_json_path)),
       default_golden_bounds_path_(golden_speaker_bounds_json_path),
       golden_bounds_path_(golden_speaker_bounds_json_path),
       pipeline_snapshot_path_(std::move(pipeline_snapshot_json_path)),
@@ -596,6 +583,9 @@ Pyannote::Pyannote(
       alloc_{},
       in_name_(session_.GetInputNameAllocated(0, alloc_)),
       out_name_(session_.GetOutputNameAllocated(0, alloc_)) {
+  if (embedding_onnx_path_.empty() || xvec_npz_path_.empty() || plda_npz_path_.empty()) {
+    throw std::runtime_error("CppAnnote requires embedding ONNX, xvec transform NPZ, and PLDA NPZ paths");
+  }
   std::string json_path = onnx_path_;
   if (json_path.size() > 5 && json_path.substr(json_path.size() - 5) == ".onnx") {
     json_path = json_path.substr(0, json_path.size() - 5) + ".json";
@@ -637,8 +627,7 @@ Pyannote::Pyannote(
     }
   }
 
-  vbx_mode_ = !embedding_onnx_path_.empty() && !xvec_npz_path_.empty() && !plda_npz_path_.empty();
-  if (vbx_mode_) {
+  {
     std::string emb_json_path = embedding_onnx_path_;
     if (emb_json_path.size() > 5 && emb_json_path.substr(emb_json_path.size() - 5) == ".onnx") {
       emb_json_path = emb_json_path.substr(0, emb_json_path.size() - 5) + ".json";
@@ -671,14 +660,7 @@ Pyannote::Pyannote(
   }
 }
 
-void Pyannote::set_utterance_paths(
-    std::string clusters_npz_path,
-    std::string label_mapping_json_path,
-    std::string golden_speaker_bounds_json_path) {
-  if (!vbx_mode_) {
-    clusters_path_ = std::move(clusters_npz_path);
-  }
-  label_mapping_path_ = std::move(label_mapping_json_path);
+void CppAnnote::set_golden_speaker_bounds(std::string golden_speaker_bounds_json_path) {
   if (!golden_speaker_bounds_json_path.empty()) {
     golden_bounds_path_ = std::move(golden_speaker_bounds_json_path);
   } else {
@@ -686,7 +668,7 @@ void Pyannote::set_utterance_paths(
   }
 }
 
-std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, std::int32_t sample_rate) {
+std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, std::int32_t sample_rate) {
   const int sr_model = cfg_.sr_model;
   const int num_channels = cfg_.num_channels;
   const int chunk_num_samples = cfg_.chunk_num_samples;
@@ -716,23 +698,6 @@ std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, st
 
   std::vector<std::int8_t> hard_clusters_row;
   const std::int8_t* hptr = nullptr;
-
-  if (!vbx_mode_) {
-    cnpy::npz_t clz = cnpy::npz_load(clusters_path_);
-    if (!clz.count("hard_clusters")) {
-      throw std::runtime_error("clusters npz missing hard_clusters: " + clusters_path_);
-    }
-    const cnpy::NpyArray& hc = clz["hard_clusters"];
-    if (hc.shape.size() != 2 || static_cast<int64_t>(hc.shape[0]) != total_chunks) {
-      std::ostringstream oss;
-      oss << "hard_clusters first dim " << hc.shape[0] << " != num_chunks " << total_chunks;
-      throw std::runtime_error(oss.str());
-    }
-    const std::int8_t* hp0 = hc.data<std::int8_t>();
-    hard_clusters_row.assign(
-        hp0, hp0 + static_cast<size_t>(hc.num_vals));
-    hptr = hard_clusters_row.data();
-  }
 
   std::vector<float> seg_out;
   int n_frames = 0;
@@ -804,8 +769,7 @@ std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, st
     if (dg[0] == '1' && dg[1] == '\0') {
       std::cerr << "[PYANNOTE_CPP_DIAG] sr_model=" << sr_model << " num_samples=" << num_samples
                 << " num_chunks=" << num_chunks << " has_last=" << (has_last ? 1 : 0)
-                << " total_chunks=" << total_chunks << " F=" << n_frames << " K=" << n_classes
-                << " vbx_mode=" << (vbx_mode_ ? 1 : 0) << "\n";
+                << " total_chunks=" << total_chunks << " F=" << n_frames << " K=" << n_classes << "\n";
     }
   }
 
@@ -814,13 +778,10 @@ std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, st
   const int Kcls = n_classes;
   std::vector<float> binarized = seg_out;
   if (!multilabel_export) {
-    throw std::runtime_error("Pyannote expects export_includes_powerset_to_multilabel=true in ONNX sidecar");
+    throw std::runtime_error("CppAnnote expects export_includes_powerset_to_multilabel=true in ONNX sidecar");
   }
 
-  if (vbx_mode_) {
-    if (!plda_model_ || !embed_session_) {
-      throw std::runtime_error("VBx mode: missing PLDA or embedding ONNX session.");
-    }
+  {
     const int dim = embed_dim_;
     std::vector<float> emb(
         static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim),
@@ -969,10 +930,10 @@ std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, st
   std::vector<std::int8_t> count_i8 = cap_count(cnt_u8, max_cap);
 
   // Match ``SpeakerDiarization.apply`` behavior: instantaneous count should not exceed the
-  // number of global speakers implied by ``hard_clusters`` (``np.max(hard_clusters) + 1`` in Python).
+  // number of global speakers implied by VBx ``hard_clusters`` (``np.max(hard_clusters) + 1`` in Python).
   // Otherwise a tiny ORT/Torch segmentation drift can push the per-frame sum to Kcls and inflate
   // ``max_spf`` inside ``reconstruct_to_diarization``, adding spurious speaker columns beyond
-  // ``label_mapping.json`` (e.g. a third ``SPEAKER_02`` while only two clusters exist).
+  // the detected cluster count.
   int max_cluster_id = -1;
   for (int ci = 0; ci < C; ++ci) {
     for (int j = 0; j < Kcls; ++j) {
@@ -1005,7 +966,7 @@ std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, st
   }
   const int rows = static_cast<int>(discrete.size() / static_cast<size_t>(K_di));
 
-  std::map<int, std::string> label_map = parse_label_mapping(read_text(label_mapping_path_));
+  std::map<int, std::string> label_map;
   for (int k = 0; k < K_di; ++k) {
     if (!label_map.count(k)) {
       label_map[k] = default_speaker_label(k);

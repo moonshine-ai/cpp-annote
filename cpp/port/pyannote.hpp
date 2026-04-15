@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// C++ short-path diarization: community-1 segmentation ORT, then either oracle
-// ``hard_clusters`` NPZ or VBx clustering (ORT embedding + PLDA) when embedding paths are set.
+// C++ short-path diarization: community-1 segmentation ORT, then VBx clustering
+// (ORT embedding + PLDA) in ``diarize``.
 
 #pragma once
 
@@ -31,46 +31,34 @@ struct DiarizationTurn {
   }
 };
 
-/// Loads segmentation ONNX, receptive field, and pipeline snapshot once.
-  /// When ``embedding_onnx_path`` (and xvec/plda) are non-empty, VBx clustering runs in
-  /// ``diarize`` and ``clusters_npz_path`` is ignored. Otherwise oracle NPZ is loaded each call.
-class Pyannote {
+/// Loads segmentation ONNX, embedding ONNX, PLDA, receptive field, and pipeline snapshot once.
+/// Cluster assignments are produced in C++ via VBx in ``diarize``.
+class CppAnnote {
  public:
-  /// Paths default to the CallHome golden bundle used in ``community1_shortpath`` docs
-  /// (relative to the process current working directory, as with the CLI).
-  explicit Pyannote(
-      std::string segmentation_onnx_path = "cpp/artifacts/community1-segmentation.onnx",
-      std::string receptive_field_json_path = "cpp/golden/callhome_eng_idx0/receptive_field.json",
-      std::string clusters_npz_path =
-          "cpp/golden/callhome_eng_idx0/callhome_eng_data_idx0_head120s/hard_clusters_final.npz",
-      std::string label_mapping_json_path =
-          "cpp/golden/callhome_eng_idx0/callhome_eng_data_idx0_head120s/label_mapping.json",
-      std::string golden_speaker_bounds_json_path =
-          "cpp/golden/callhome_eng_idx0/callhome_eng_data_idx0_head120s/golden_speaker_bounds.json",
-      std::string pipeline_snapshot_json_path = "cpp/golden/callhome_eng_idx0/pipeline_snapshot.json",
-      std::string embedding_onnx_path = "",
-      std::string xvec_transform_npz_path = "",
-      std::string plda_npz_path = "");
+  /// ``embedding_onnx_path``, ``xvec_transform_npz_path``, and ``plda_npz_path`` must be non-empty.
+  /// Other paths default to the CallHome golden bundle layout (relative to process cwd).
+  explicit CppAnnote(
+      std::string segmentation_onnx_path,
+      std::string receptive_field_json_path,
+      std::string golden_speaker_bounds_json_path,
+      std::string pipeline_snapshot_json_path,
+      std::string embedding_onnx_path,
+      std::string xvec_transform_npz_path,
+      std::string plda_npz_path);
 
-  Pyannote(const Pyannote&) = delete;
-  Pyannote& operator=(const Pyannote&) = delete;
-  Pyannote(Pyannote&&) = delete;
-  Pyannote& operator=(Pyannote&&) = delete;
+  CppAnnote(const CppAnnote&) = delete;
+  CppAnnote& operator=(const CppAnnote&) = delete;
+  CppAnnote(CppAnnote&&) = delete;
+  CppAnnote& operator=(CppAnnote&&) = delete;
 
   /// Mono PCM32-ish samples at ``sample_rate`` Hz; resampled internally to the model rate.
-  /// ``hard_clusters`` row count must equal the number of segmentation chunks for this audio.
   std::vector<DiarizationTurn> diarize(std::vector<float> audio_data, std::int32_t sample_rate);
 
-  /// Use different oracle artifacts (same ONNX / RF / snapshot). For batch jobs.
-  /// If ``golden_speaker_bounds_json_path`` is empty, falls back to the constructor’s bounds path.
-  /// In VBx mode ``clusters_npz_path`` may be empty and is not used.
-  void set_utterance_paths(
-      std::string clusters_npz_path,
-      std::string label_mapping_json_path,
-      std::string golden_speaker_bounds_json_path = "");
+  /// Optional per-utterance ``golden_speaker_bounds.json`` for batch jobs. Empty string keeps the
+  /// constructor default.
+  void set_golden_speaker_bounds(std::string golden_speaker_bounds_json_path);
 
   [[nodiscard]] const std::string& segmentation_onnx_path() const { return onnx_path_; }
-  [[nodiscard]] const std::string& clusters_npz_path() const { return clusters_path_; }
 
  private:
   struct SegConfig {
@@ -84,8 +72,6 @@ class Pyannote {
 
   std::string onnx_path_;
   std::string receptive_field_path_;
-  std::string clusters_path_;
-  std::string label_mapping_path_;
   std::string golden_bounds_path_;
   std::string default_golden_bounds_path_;
   std::string pipeline_snapshot_path_;
@@ -104,7 +90,6 @@ class Pyannote {
   Ort::AllocatedStringPtr in_name_;
   Ort::AllocatedStringPtr out_name_;
 
-  bool vbx_mode_ = false;
   std::string embedding_onnx_path_;
   std::string xvec_npz_path_;
   std::string plda_npz_path_;

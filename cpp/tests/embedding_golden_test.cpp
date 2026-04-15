@@ -2,7 +2,7 @@
 // Compare ONNX Runtime embedding output to Python golden (Torch ``embeddings.npz``).
 //  * Default: chunk 0 / speaker 0 vs ``embedding_chunk0_spk0_ort.npz`` (ORT inputs from dump).
 //  * ``--all``: recompute ORT embeddings for every chunk/speaker from WAV + golden
-//    ``binarized_segmentations.npz`` (same recipe as ``Pyannote::diarize``) vs full ``embeddings.npz``.
+//    ``binarized_segmentations.npz`` (same recipe as ``CppAnnote::diarize``) vs full ``embeddings.npz``.
 
 #include <onnxruntime_cxx_api.h>
 
