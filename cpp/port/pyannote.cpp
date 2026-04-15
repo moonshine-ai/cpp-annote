@@ -1,0 +1,1062 @@
+// SPDX-License-Identifier: MIT
+
+#include "pyannote.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <climits>
+#include <map>
+#include <numeric>
+#include <regex>
+#include <sstream>
+#include <stdexcept>
+
+#include "annotation_support.hpp"
+#include "clustering_vbx.hpp"
+#include "compute_fbank.hpp"
+#include "embedding_ort_infer.hpp"
+#include "cnpy.h"
+#include "parity_log.hpp"
+#include "plda_vbx.hpp"
+#include "wav_pcm_float32.hpp"
+
+namespace pyannote {
+namespace detail {
+
+std::string json_escape(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '"' || c == '\\') {
+      o += '\\';
+    }
+    o += c;
+  }
+  return o;
+}
+
+}  // namespace detail
+
+namespace {
+
+std::string read_text(const std::string& p) {
+  std::ifstream f(p, std::ios::binary);
+  if (!f) {
+    throw std::runtime_error("open failed: " + p);
+  }
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+double json_double(const std::string& json, const char* key) {
+  const std::string pat = std::string("\"") + key + "\"\\s*:\\s*([-+0-9.eE]+)";
+  std::regex re(pat);
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) {
+    throw std::runtime_error(std::string("json missing \"") + key + "\"");
+  }
+  return std::stod(m[1].str());
+}
+
+bool json_bool(const std::string& json, const char* key) {
+  const std::string pat = std::string("\"") + key + "\"\\s*:\\s*(true|false)";
+  std::regex re(pat);
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) {
+    throw std::runtime_error(std::string("json missing bool \"") + key + "\"");
+  }
+  return m[1].str() == "true";
+}
+
+int closest_frame(double t, double sw_start, double sw_duration, double sw_step) {
+  const double x = (t - sw_start - 0.5 * sw_duration) / sw_step;
+  return static_cast<int>(std::lrint(x));
+}
+
+void trim_warmup_inplace(
+    std::vector<float>& data,
+    size_t num_chunks,
+    size_t& num_frames,
+    size_t num_classes,
+    double warm0,
+    double warm1,
+    double& chunk_start,
+    double& chunk_duration) {
+  const size_t n_left = static_cast<size_t>(std::lrint(static_cast<double>(num_frames) * warm0));
+  const size_t n_right = static_cast<size_t>(std::lrint(static_cast<double>(num_frames) * warm1));
+  if (n_left + n_right >= num_frames) {
+    throw std::runtime_error("trim: warm_up removes all frames");
+  }
+  const size_t new_frames = num_frames - n_left - n_right;
+  std::vector<float> out(num_chunks * new_frames * num_classes);
+  for (size_t c = 0; c < num_chunks; ++c) {
+    for (size_t f = 0; f < new_frames; ++f) {
+      for (size_t k = 0; k < num_classes; ++k) {
+        out[(c * new_frames + f) * num_classes + k] =
+            data[(c * num_frames + (f + n_left)) * num_classes + k];
+      }
+    }
+  }
+  data.swap(out);
+  num_frames = new_frames;
+  chunk_start += warm0 * chunk_duration;
+  chunk_duration *= (1.0 - warm0 - warm1);
+}
+
+void inference_aggregate(
+    const std::vector<float>& scores,
+    size_t num_chunks,
+    size_t num_frames_per_chunk,
+    size_t num_classes,
+    double chunks_start,
+    double chunks_duration,
+    double chunks_step,
+    double out_duration,
+    double out_step,
+    bool skip_average,
+    float epsilon,
+    float missing,
+    std::vector<float>& out_avg,
+    int& num_out_frames) {
+  const double out_sw_start = chunks_start;
+  const double out_sw_duration = out_duration;
+  const double out_sw_step = out_step;
+  const double end_t = chunks_start + chunks_duration +
+                       static_cast<double>(num_chunks - 1) * chunks_step + 0.5 * out_sw_duration;
+  num_out_frames = closest_frame(end_t, out_sw_start, out_sw_duration, out_sw_step) + 1;
+  if (num_out_frames <= 0) {
+    throw std::runtime_error("aggregate: non-positive num_out_frames");
+  }
+  const int nf = static_cast<int>(num_frames_per_chunk);
+  const int nc = static_cast<int>(num_classes);
+  std::vector<float> agg(static_cast<size_t>(num_out_frames) * num_classes, 0.f);
+  std::vector<float> occ(static_cast<size_t>(num_out_frames) * num_classes, 0.f);
+  std::vector<float> mask_max(static_cast<size_t>(num_out_frames) * num_classes, 0.f);
+  for (size_t ci = 0; ci < num_chunks; ++ci) {
+    const double chunk_start = chunks_start + static_cast<double>(ci) * chunks_step;
+    const int start_frame =
+        closest_frame(chunk_start + 0.5 * out_sw_duration, out_sw_start, out_sw_duration, out_sw_step);
+    for (int j = 0; j < nf; ++j) {
+      for (int k = 0; k < nc; ++k) {
+        const size_t idx =
+            (ci * static_cast<size_t>(nf) + static_cast<size_t>(j)) * num_classes + static_cast<size_t>(k);
+        const float raw = scores[idx];
+        const float mask = std::isnan(raw) ? 0.f : 1.f;
+        float score = raw;
+        if (std::isnan(score)) {
+          score = 0.f;
+        }
+        const int fi = start_frame + j;
+        if (fi < 0 || fi >= num_out_frames) {
+          continue;
+        }
+        const size_t o = static_cast<size_t>(fi) * static_cast<size_t>(nc) + static_cast<size_t>(k);
+        agg[o] += score * mask;
+        occ[o] += mask;
+        mask_max[o] = std::max(mask_max[o], mask);
+      }
+    }
+  }
+  out_avg.resize(static_cast<size_t>(num_out_frames) * num_classes);
+  for (int fi = 0; fi < num_out_frames; ++fi) {
+    for (int k = 0; k < nc; ++k) {
+      const size_t o = static_cast<size_t>(fi) * static_cast<size_t>(nc) + static_cast<size_t>(k);
+      if (skip_average) {
+        out_avg[o] = agg[o];
+      } else {
+        out_avg[o] = agg[o] / std::max(occ[o], epsilon);
+      }
+      if (mask_max[o] == 0.f) {
+        out_avg[o] = missing;
+      }
+    }
+  }
+}
+
+std::vector<std::uint8_t> speaker_count_initial_uint8(
+    std::vector<float> binarized,
+    size_t num_chunks,
+    size_t num_frames,
+    size_t num_classes,
+    double& chunk_start,
+    double chunk_step,
+    double& chunk_duration,
+    double rf_dur,
+    double rf_step,
+    int& num_out_frames) {
+  size_t nf = num_frames;
+  trim_warmup_inplace(binarized, num_chunks, nf, num_classes, 0.0, 0.0, chunk_start, chunk_duration);
+  std::vector<float> summed(num_chunks * nf * 1);
+  for (size_t c = 0; c < num_chunks; ++c) {
+    for (size_t f = 0; f < nf; ++f) {
+      float s = 0.f;
+      for (size_t k = 0; k < num_classes; ++k) {
+        s += binarized[(c * nf + f) * num_classes + k];
+      }
+      summed[c * nf + f] = s;
+    }
+  }
+  std::vector<float> avg;
+  inference_aggregate(
+      summed,
+      num_chunks,
+      nf,
+      1,
+      chunk_start,
+      chunk_duration,
+      chunk_step,
+      rf_dur,
+      rf_step,
+      false,
+      1e-12f,
+      0.f,
+      avg,
+      num_out_frames);
+  std::vector<std::uint8_t> out(static_cast<size_t>(num_out_frames));
+  for (int i = 0; i < num_out_frames; ++i) {
+    const double r = std::rint(static_cast<double>(avg[static_cast<size_t>(i)]));
+    out[static_cast<size_t>(i)] =
+        static_cast<std::uint8_t>(std::max(0.0, std::min(255.0, r)));
+  }
+  return out;
+}
+
+std::vector<std::int8_t> cap_count(const std::vector<std::uint8_t>& u8, int max_cap) {
+  std::vector<std::int8_t> out(u8.size());
+  for (size_t i = 0; i < u8.size(); ++i) {
+    const int m = std::min(static_cast<int>(u8[i]), max_cap);
+    out[i] = static_cast<std::int8_t>(static_cast<std::uint8_t>(m));
+  }
+  return out;
+}
+
+void crop_loose_frame_range(
+    double focus_start,
+    double focus_end,
+    double sw_start,
+    double sw_duration,
+    double sw_step,
+    int& out_i0,
+    int& out_i1_exclusive) {
+  const double i_ = (focus_start - sw_duration - sw_start) / sw_step;
+  int i = static_cast<int>(std::ceil(i_));
+  const double j_ = (focus_end - sw_start) / sw_step;
+  int j = static_cast<int>(std::floor(j_));
+  out_i0 = i;
+  out_i1_exclusive = j + 1;
+}
+
+void extent_of_frames(double sw_start, double sw_step, size_t n_rows, double& seg_start, double& seg_end) {
+  seg_start = sw_start;
+  seg_end = sw_start + static_cast<double>(n_rows) * sw_step;
+}
+
+void crop_feature_loose(
+    const std::vector<float>& data,
+    int n_samples,
+    int n_cols,
+    double sw_start,
+    double sw_duration,
+    double sw_step,
+    double focus_start,
+    double focus_end,
+    std::vector<float>& out_data,
+    int& out_rows,
+    double& new_sw_start) {
+  int i0 = 0;
+  int i1 = 0;
+  crop_loose_frame_range(focus_start, focus_end, sw_start, sw_duration, sw_step, i0, i1);
+  const int clipped0 = std::max(0, i0);
+  const int clipped1 = std::min(n_samples, i1);
+  if (clipped0 >= clipped1) {
+    out_rows = 0;
+    out_data.clear();
+    new_sw_start = sw_start;
+    return;
+  }
+  out_rows = clipped1 - clipped0;
+  out_data.resize(static_cast<size_t>(out_rows) * static_cast<size_t>(n_cols));
+  for (int r = 0; r < out_rows; ++r) {
+    const int src_row = clipped0 + r;
+    for (int c = 0; c < n_cols; ++c) {
+      out_data[static_cast<size_t>(r) * static_cast<size_t>(n_cols) + static_cast<size_t>(c)] =
+          data[static_cast<size_t>(src_row) * static_cast<size_t>(n_cols) + static_cast<size_t>(c)];
+    }
+  }
+  new_sw_start = sw_start + static_cast<double>(clipped0) * sw_step;
+}
+
+std::vector<int> argsort_desc_stable(const float* row, int k) {
+  std::vector<int> idx(static_cast<size_t>(k));
+  std::iota(idx.begin(), idx.end(), 0);
+  std::stable_sort(idx.begin(), idx.end(), [row](int a, int b) {
+    if (row[a] != row[b]) {
+      return row[a] > row[b];
+    }
+    return a < b;
+  });
+  return idx;
+}
+
+std::vector<float> reconstruct_to_diarization(
+    const std::vector<float>& segmentations,
+    int C,
+    int F,
+    int L,
+    double seg_ss,
+    double seg_sd,
+    double seg_st,
+    const std::int8_t* hard_clusters,
+    const std::vector<std::int8_t>& count_flat,
+    double cnt_ss,
+    double cnt_sd,
+    double cnt_st,
+    int& out_num_speaker_cols) {
+  int max_clu = -3;
+  for (int c = 0; c < C; ++c) {
+    for (int j = 0; j < L; ++j) {
+      max_clu = std::max(max_clu, static_cast<int>(hard_clusters[c * L + j]));
+    }
+  }
+  const int num_clusters = max_clu + 1;
+  if (num_clusters <= 0) {
+    throw std::runtime_error("reconstruct: no positive cluster ids");
+  }
+  std::vector<float> clustered(static_cast<size_t>(C) * static_cast<size_t>(F) * static_cast<size_t>(num_clusters),
+                             std::numeric_limits<float>::quiet_NaN());
+  for (int c = 0; c < C; ++c) {
+    const float* segm = &segmentations[static_cast<size_t>(c) * static_cast<size_t>(F) * static_cast<size_t>(L)];
+    const std::int8_t* cluster = &hard_clusters[c * L];
+    std::vector<char> seen_k(static_cast<size_t>(num_clusters), 0);
+    for (int j = 0; j < L; ++j) {
+      const int k = static_cast<int>(cluster[j]);
+      if (k == -2) {
+        continue;
+      }
+      if (k >= 0 && k < num_clusters) {
+        seen_k[static_cast<size_t>(k)] = 1;
+      }
+    }
+    for (int k = 0; k < num_clusters; ++k) {
+      if (!seen_k[static_cast<size_t>(k)]) {
+        continue;
+      }
+      for (int f = 0; f < F; ++f) {
+        bool any_finite = false;
+        float m = 0.f;
+        for (int j = 0; j < L; ++j) {
+          if (static_cast<int>(cluster[j]) != k) {
+            continue;
+          }
+          const float v = segm[static_cast<size_t>(f) * static_cast<size_t>(L) + static_cast<size_t>(j)];
+          if (std::isnan(v)) {
+            continue;
+          }
+          if (!any_finite) {
+            m = v;
+            any_finite = true;
+          } else {
+            m = std::max(m, v);
+          }
+        }
+        const size_t dst = (static_cast<size_t>(c) * static_cast<size_t>(F) + static_cast<size_t>(f)) *
+                               static_cast<size_t>(num_clusters) +
+                           static_cast<size_t>(k);
+        clustered[dst] = any_finite ? m : std::numeric_limits<float>::quiet_NaN();
+      }
+    }
+  }
+  std::vector<float> activations;
+  int T = 0;
+  inference_aggregate(
+      clustered,
+      static_cast<size_t>(C),
+      static_cast<size_t>(F),
+      static_cast<size_t>(num_clusters),
+      seg_ss,
+      seg_sd,
+      seg_st,
+      cnt_sd,
+      cnt_st,
+      true,
+      1e-12f,
+      0.f,
+      activations,
+      T);
+  int K = num_clusters;
+  int max_spf = 0;
+  for (size_t t = 0; t < count_flat.size(); ++t) {
+    max_spf = std::max(max_spf, static_cast<int>(count_flat[t]));
+  }
+  max_spf = std::max(0, max_spf);
+  if (K < max_spf) {
+    std::vector<float> padded(static_cast<size_t>(T) * static_cast<size_t>(max_spf), 0.f);
+    for (int t = 0; t < T; ++t) {
+      for (int k = 0; k < K; ++k) {
+        padded[static_cast<size_t>(t) * static_cast<size_t>(max_spf) + static_cast<size_t>(k)] =
+            activations[static_cast<size_t>(t) * static_cast<size_t>(K) + static_cast<size_t>(k)];
+      }
+    }
+    activations.swap(padded);
+    K = max_spf;
+  }
+  double act_s = 0, act_e = 0;
+  extent_of_frames(cnt_ss, cnt_st, static_cast<size_t>(T), act_s, act_e);
+  const int Tcnt = static_cast<int>(count_flat.size());
+  double cnt_s = 0, cnt_e = 0;
+  extent_of_frames(cnt_ss, cnt_st, static_cast<size_t>(Tcnt), cnt_s, cnt_e);
+  const double inter_s = std::max(act_s, cnt_s);
+  const double inter_e = std::min(act_e, cnt_e);
+  std::vector<float> act_cropped;
+  int act_rows = 0;
+  double tmp0 = 0.;
+  crop_feature_loose(activations, T, K, cnt_ss, cnt_sd, cnt_st, inter_s, inter_e, act_cropped, act_rows, tmp0);
+  std::vector<float> cnt_2d(static_cast<size_t>(Tcnt));
+  for (int t = 0; t < Tcnt; ++t) {
+    cnt_2d[static_cast<size_t>(t)] = static_cast<float>(count_flat[static_cast<size_t>(t)]);
+  }
+  std::vector<float> cnt_cropped;
+  int cnt_rows = 0;
+  double tmp1 = 0.;
+  crop_feature_loose(cnt_2d, Tcnt, 1, cnt_ss, cnt_sd, cnt_st, inter_s, inter_e, cnt_cropped, cnt_rows, tmp1);
+  if (act_rows != cnt_rows) {
+    throw std::runtime_error("crop row mismatch");
+  }
+  std::vector<float> binary(static_cast<size_t>(act_rows) * static_cast<size_t>(K), 0.f);
+  for (int t = 0; t < act_rows; ++t) {
+    const float* arow = &act_cropped[static_cast<size_t>(t) * static_cast<size_t>(K)];
+    std::vector<int> order = argsort_desc_stable(arow, K);
+    const int c = static_cast<int>(std::lrint(static_cast<double>(cnt_cropped[static_cast<size_t>(t)])));
+    const int c_use = std::max(0, std::min(c, K));
+    for (int i = 0; i < c_use; ++i) {
+      binary[static_cast<size_t>(t) * static_cast<size_t>(K) + static_cast<size_t>(order[static_cast<size_t>(i)])] =
+          1.f;
+    }
+  }
+  out_num_speaker_cols = K;
+  return binary;
+}
+
+void binarize_column(
+    const float* k_scores,
+    int num_frames,
+    double sw_start,
+    double sw_dur,
+    double sw_step,
+    double onset,
+    double offset,
+    double pad_onset,
+    double pad_offset,
+    std::vector<std::pair<double, double>>& regions_out) {
+  if (num_frames <= 0) {
+    return;
+  }
+  std::vector<double> ts(static_cast<size_t>(num_frames));
+  for (int i = 0; i < num_frames; ++i) {
+    ts[static_cast<size_t>(i)] = sw_start + static_cast<double>(i) * sw_step + 0.5 * sw_dur;
+  }
+  double start = ts[0];
+  bool is_active = static_cast<double>(k_scores[0]) > onset;
+  for (int i = 1; i < num_frames; ++i) {
+    const double t = ts[static_cast<size_t>(i)];
+    const double y = static_cast<double>(k_scores[i]);
+    if (is_active) {
+      if (y < offset) {
+        regions_out.emplace_back(start - pad_onset, t + pad_offset);
+        start = t;
+        is_active = false;
+      }
+    } else {
+      if (y > onset) {
+        start = t;
+        is_active = true;
+      }
+    }
+  }
+  if (is_active) {
+    const double t_end = ts[static_cast<size_t>(num_frames - 1)];
+    regions_out.emplace_back(start - pad_onset, t_end + pad_offset);
+  }
+}
+
+std::map<int, std::string> parse_label_mapping(const std::string& json) {
+  std::map<int, std::string> m;
+  std::regex re("\"([0-9]+)\"\\s*:\\s*\"([^\"]*)\"");
+  for (std::sregex_iterator it(json.begin(), json.end(), re), end; it != end; ++it) {
+    m[std::stoi((*it)[1].str())] = (*it)[2].str();
+  }
+  return m;
+}
+
+bool try_regex_double(const std::string& json, const std::string& key_esc, double& out) {
+  const std::string pat = "\"" + key_esc + "\"\\s*:\\s*([-+0-9.eE]+)";
+  std::regex re(pat);
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) {
+    return false;
+  }
+  out = std::stod(m[1].str());
+  return true;
+}
+
+void filter_min_duration_on(std::vector<std::pair<double, double>>& regs, double min_on) {
+  if (min_on <= 0.0) {
+    return;
+  }
+  std::vector<std::pair<double, double>> kept;
+  for (const auto& pr : regs) {
+    if (pr.second - pr.first >= min_on - 1e-12) {
+      kept.push_back(pr);
+    }
+  }
+  regs.swap(kept);
+}
+
+bool try_json_bool_field(const std::string& json, const char* key_esc, bool& out) {
+  const std::string pat = std::string("\"") + key_esc + "\"\\s*:\\s*(true|false)";
+  std::regex re(pat);
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) {
+    return false;
+  }
+  out = (m[1].str() == "true");
+  return true;
+}
+
+bool try_regex_int(const std::string& json, const std::string& key_esc, int& out) {
+  const std::string pat = "\"" + key_esc + "\"\\s*:\\s*([-+0-9]+)";
+  std::regex re(pat);
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) {
+    return false;
+  }
+  out = std::stoi(m[1].str());
+  return true;
+}
+
+std::string default_speaker_label(int k) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "SPEAKER_%02d", k);
+  return std::string(buf);
+}
+
+}  // namespace
+
+void write_diarization_json(const std::string& path, const std::vector<DiarizationTurn>& turns) {
+  std::ofstream f(path);
+  if (!f) {
+    throw std::runtime_error("write failed: " + path);
+  }
+  f << std::setprecision(17);
+  f << "[\n";
+  for (size_t i = 0; i < turns.size(); ++i) {
+    const DiarizationTurn& t = turns[i];
+    f << "  {\"start\": " << t.start << ", \"end\": " << t.end << ", \"speaker\": \"" << detail::json_escape(t.speaker)
+      << "\"}";
+    if (i + 1 < turns.size()) {
+      f << ",";
+    }
+    f << "\n";
+  }
+  f << "]\n";
+}
+
+Pyannote::Pyannote(
+    std::string segmentation_onnx_path,
+    std::string receptive_field_json_path,
+    std::string clusters_npz_path,
+    std::string label_mapping_json_path,
+    std::string golden_speaker_bounds_json_path,
+    std::string pipeline_snapshot_json_path,
+    std::string embedding_onnx_path,
+    std::string xvec_transform_npz_path,
+    std::string plda_npz_path)
+    : onnx_path_(std::move(segmentation_onnx_path)),
+      receptive_field_path_(std::move(receptive_field_json_path)),
+      clusters_path_(std::move(clusters_npz_path)),
+      label_mapping_path_(std::move(label_mapping_json_path)),
+      default_golden_bounds_path_(golden_speaker_bounds_json_path),
+      golden_bounds_path_(golden_speaker_bounds_json_path),
+      pipeline_snapshot_path_(std::move(pipeline_snapshot_json_path)),
+      embedding_onnx_path_(std::move(embedding_onnx_path)),
+      xvec_npz_path_(std::move(xvec_transform_npz_path)),
+      plda_npz_path_(std::move(plda_npz_path)),
+      ort_env_(ORT_LOGGING_LEVEL_WARNING, "pyannote_cpp"),
+      session_options_{},
+      session_(ort_env_, onnx_path_.c_str(), session_options_),
+      mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+      alloc_{},
+      in_name_(session_.GetInputNameAllocated(0, alloc_)),
+      out_name_(session_.GetOutputNameAllocated(0, alloc_)) {
+  std::string json_path = onnx_path_;
+  if (json_path.size() > 5 && json_path.substr(json_path.size() - 5) == ".onnx") {
+    json_path = json_path.substr(0, json_path.size() - 5) + ".json";
+  } else {
+    json_path += ".json";
+  }
+  const std::string seg_json = read_text(json_path);
+  cfg_.sr_model = static_cast<int>(json_double(seg_json, "sample_rate"));
+  cfg_.num_channels = static_cast<int>(json_double(seg_json, "num_channels"));
+  cfg_.chunk_num_samples = static_cast<int>(json_double(seg_json, "chunk_num_samples"));
+  cfg_.multilabel_export = json_bool(seg_json, "export_includes_powerset_to_multilabel");
+  cfg_.chunk_step_sec = 0.1 * json_double(seg_json, "chunk_duration_sec");
+  {
+    std::regex re("\"chunk_step_sec\"\\s*:\\s*([-+0-9.eE]+)");
+    std::smatch m;
+    if (std::regex_search(seg_json, m, re)) {
+      cfg_.chunk_step_sec = std::stod(m[1].str());
+    }
+  }
+  cfg_.chunk_dur_sec = json_double(seg_json, "chunk_duration_sec");
+
+  const std::string rf_txt = read_text(receptive_field_path_);
+  rf_dur_ = json_double(rf_txt, "duration");
+  rf_step_ = json_double(rf_txt, "step");
+
+  if (!pipeline_snapshot_path_.empty()) {
+    const std::string sj = read_text(pipeline_snapshot_path_);
+    try_regex_double(sj, "segmentation\\.min_duration_off", min_off_);
+    try_regex_double(sj, "segmentation\\.min_duration_on", min_on_);
+    try_json_bool_field(sj, "embedding_exclude_overlap", embedding_exclude_overlap_);
+    try_regex_double(sj, "clustering\\.threshold", vbx_params_.threshold);
+    try_regex_double(sj, "clustering\\.Fa", vbx_params_.Fa);
+    try_regex_double(sj, "clustering\\.Fb", vbx_params_.Fb);
+    {
+      int lda_dim = vbx_params_.lda_dimension;
+      if (try_regex_int(sj, "clustering\\.lda_dimension", lda_dim)) {
+        vbx_params_.lda_dimension = lda_dim;
+      }
+    }
+  }
+
+  vbx_mode_ = !embedding_onnx_path_.empty() && !xvec_npz_path_.empty() && !plda_npz_path_.empty();
+  if (vbx_mode_) {
+    std::string emb_json_path = embedding_onnx_path_;
+    if (emb_json_path.size() > 5 && emb_json_path.substr(emb_json_path.size() - 5) == ".onnx") {
+      emb_json_path = emb_json_path.substr(0, emb_json_path.size() - 5) + ".json";
+    } else {
+      emb_json_path += ".json";
+    }
+    const std::string emb_json = read_text(emb_json_path);
+    embed_sr_ = static_cast<int>(json_double(emb_json, "sample_rate"));
+    embed_mel_bins_ = static_cast<int>(json_double(emb_json, "num_mel_bins"));
+    embed_frame_length_ms_ = static_cast<float>(json_double(emb_json, "frame_length_ms"));
+    embed_frame_shift_ms_ = static_cast<float>(json_double(emb_json, "frame_shift_ms"));
+    embed_dim_ = static_cast<int>(json_double(emb_json, "embedding_dim"));
+    embed_inputs_fbank_then_weights_ = embedding_ort::embedding_json_inputs_fbank_first(emb_json);
+    embed_session_ = std::make_unique<Ort::Session>(ort_env_, embedding_onnx_path_.c_str(), session_options_);
+    min_num_samples_ = embedding_ort::discover_min_num_samples_embedding(
+        *embed_session_,
+        mem_,
+        alloc_,
+        embed_inputs_fbank_then_weights_,
+        embed_sr_,
+        embed_mel_bins_,
+        embed_frame_length_ms_,
+        embed_frame_shift_ms_,
+        embed_dim_);
+    plda_model_ = std::make_unique<plda_vbx::PldaModel>();
+    plda_model_->load(xvec_npz_path_, plda_npz_path_, vbx_params_.lda_dimension);
+    vbx_params_.min_clusters = 1;
+    vbx_params_.max_clusters = 1000000000;
+    vbx_params_.num_clusters = -1;
+  }
+}
+
+void Pyannote::set_utterance_paths(
+    std::string clusters_npz_path,
+    std::string label_mapping_json_path,
+    std::string golden_speaker_bounds_json_path) {
+  if (!vbx_mode_) {
+    clusters_path_ = std::move(clusters_npz_path);
+  }
+  label_mapping_path_ = std::move(label_mapping_json_path);
+  if (!golden_speaker_bounds_json_path.empty()) {
+    golden_bounds_path_ = std::move(golden_speaker_bounds_json_path);
+  } else {
+    golden_bounds_path_ = default_golden_bounds_path_;
+  }
+}
+
+std::vector<DiarizationTurn> Pyannote::diarize(std::vector<float> audio_data, std::int32_t sample_rate) {
+  const int sr_model = cfg_.sr_model;
+  const int num_channels = cfg_.num_channels;
+  const int chunk_num_samples = cfg_.chunk_num_samples;
+  const bool multilabel_export = cfg_.multilabel_export;
+  const double chunk_step_sec = cfg_.chunk_step_sec;
+  const double chunk_dur_sec = cfg_.chunk_dur_sec;
+
+  std::vector<float> audio =
+      wav_pcm::linear_resample(audio_data, static_cast<int>(sample_rate), sr_model);
+
+  const int step_samples = static_cast<int>(std::lrint(chunk_step_sec * static_cast<double>(sr_model)));
+  if (step_samples <= 0 || chunk_num_samples <= 0) {
+    throw std::runtime_error("bad chunk/step samples");
+  }
+
+  const int64_t num_samples = static_cast<int64_t>(audio.size());
+  int64_t num_chunks = 0;
+  if (num_samples >= chunk_num_samples) {
+    num_chunks = (num_samples - chunk_num_samples) / step_samples + 1;
+  }
+  const bool has_last =
+      (num_samples < chunk_num_samples) || ((num_samples - chunk_num_samples) % step_samples > 0);
+  const int64_t total_chunks = num_chunks + (has_last ? 1 : 0);
+  if (total_chunks <= 0) {
+    return {};
+  }
+
+  std::vector<std::int8_t> hard_clusters_row;
+  const std::int8_t* hptr = nullptr;
+
+  if (!vbx_mode_) {
+    cnpy::npz_t clz = cnpy::npz_load(clusters_path_);
+    if (!clz.count("hard_clusters")) {
+      throw std::runtime_error("clusters npz missing hard_clusters: " + clusters_path_);
+    }
+    const cnpy::NpyArray& hc = clz["hard_clusters"];
+    if (hc.shape.size() != 2 || static_cast<int64_t>(hc.shape[0]) != total_chunks) {
+      std::ostringstream oss;
+      oss << "hard_clusters first dim " << hc.shape[0] << " != num_chunks " << total_chunks;
+      throw std::runtime_error(oss.str());
+    }
+    const std::int8_t* hp0 = hc.data<std::int8_t>();
+    hard_clusters_row.assign(
+        hp0, hp0 + static_cast<size_t>(hc.num_vals));
+    hptr = hard_clusters_row.data();
+  }
+
+  std::vector<float> seg_out;
+  int n_frames = 0;
+  int n_classes = 0;
+
+  auto run_chunk = [&](const float* wav_data, int64_t chunk_idx) {
+    const std::array<int64_t, 3> in_shape{1, num_channels, chunk_num_samples};
+    Ort::Value in_tensor = Ort::Value::CreateTensor<float>(
+        mem_,
+        const_cast<float*>(wav_data),
+        static_cast<size_t>(1 * num_channels * chunk_num_samples),
+        in_shape.data(),
+        in_shape.size());
+    const char* in_names[] = {in_name_.get()};
+    const char* out_names[] = {out_name_.get()};
+    auto outs = session_.Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, 1);
+    float* op = outs[0].GetTensorMutableData<float>();
+    auto sh = outs[0].GetTensorTypeAndShapeInfo().GetShape();
+    if (sh.size() != 3 || sh[0] != 1) {
+      throw std::runtime_error("unexpected ORT output rank");
+    }
+    const int F = static_cast<int>(sh[1]);
+    const int K = static_cast<int>(sh[2]);
+    if (chunk_idx == 0) {
+      n_frames = F;
+      n_classes = K;
+      seg_out.resize(static_cast<size_t>(total_chunks) * static_cast<size_t>(F) * static_cast<size_t>(K));
+    } else if (F != n_frames || K != n_classes) {
+      throw std::runtime_error("ORT output shape changed across chunks");
+    }
+    std::memcpy(
+        &seg_out[static_cast<size_t>(chunk_idx) * static_cast<size_t>(F) * static_cast<size_t>(K)],
+        op,
+        static_cast<size_t>(F * K) * sizeof(float));
+  };
+
+  for (int64_t c = 0; c < num_chunks; ++c) {
+    const int64_t off = c * step_samples;
+    std::vector<float> buf(static_cast<size_t>(num_channels) * static_cast<size_t>(chunk_num_samples), 0.f);
+    for (int ch = 0; ch < num_channels; ++ch) {
+      for (int i = 0; i < chunk_num_samples; ++i) {
+        const int64_t si = off + i;
+        float v = 0.f;
+        if (si >= 0 && si < num_samples) {
+          v = audio[static_cast<size_t>(si)];
+        }
+        buf[static_cast<size_t>(ch) * static_cast<size_t>(chunk_num_samples) + static_cast<size_t>(i)] = v;
+      }
+    }
+    run_chunk(buf.data(), c);
+  }
+  if (has_last) {
+    const int64_t off = num_chunks * step_samples;
+    std::vector<float> buf(static_cast<size_t>(num_channels) * static_cast<size_t>(chunk_num_samples), 0.f);
+    for (int ch = 0; ch < num_channels; ++ch) {
+      for (int i = 0; i < chunk_num_samples; ++i) {
+        const int64_t si = off + i;
+        float v = 0.f;
+        if (si >= 0 && si < num_samples) {
+          v = audio[static_cast<size_t>(si)];
+        }
+        buf[static_cast<size_t>(ch) * static_cast<size_t>(chunk_num_samples) + static_cast<size_t>(i)] = v;
+      }
+    }
+    run_chunk(buf.data(), num_chunks);
+  }
+
+  if (const char* dg = std::getenv("PYANNOTE_CPP_DIAG")) {
+    if (dg[0] == '1' && dg[1] == '\0') {
+      std::cerr << "[PYANNOTE_CPP_DIAG] sr_model=" << sr_model << " num_samples=" << num_samples
+                << " num_chunks=" << num_chunks << " has_last=" << (has_last ? 1 : 0)
+                << " total_chunks=" << total_chunks << " F=" << n_frames << " K=" << n_classes
+                << " vbx_mode=" << (vbx_mode_ ? 1 : 0) << "\n";
+    }
+  }
+
+  const int C = static_cast<int>(total_chunks);
+  const int F = n_frames;
+  const int Kcls = n_classes;
+  std::vector<float> binarized = seg_out;
+  if (!multilabel_export) {
+    throw std::runtime_error("Pyannote expects export_includes_powerset_to_multilabel=true in ONNX sidecar");
+  }
+
+  if (vbx_mode_) {
+    if (!plda_model_ || !embed_session_) {
+      throw std::runtime_error("VBx mode: missing PLDA or embedding ONNX session.");
+    }
+    const int dim = embed_dim_;
+    std::vector<float> emb(
+        static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim),
+        std::numeric_limits<float>::quiet_NaN());
+
+    for (int64_t ci = 0; ci < total_chunks; ++ci) {
+      const int64_t off = (ci < num_chunks) ? ci * step_samples : num_chunks * step_samples;
+      std::vector<float> chunk_mono(static_cast<size_t>(chunk_num_samples));
+      for (int i = 0; i < chunk_num_samples; ++i) {
+        const int64_t si = off + i;
+        float v = 0.f;
+        if (si >= 0 && si < num_samples) {
+          v = audio[static_cast<size_t>(si)];
+        }
+        chunk_mono[static_cast<size_t>(i)] = v;
+      }
+      std::vector<float> chunk_for_fbank = chunk_mono;
+      int wav_sr_use = sr_model;
+      if (sr_model != embed_sr_) {
+        chunk_for_fbank = wav_pcm::linear_resample(chunk_mono, sr_model, embed_sr_);
+        wav_sr_use = embed_sr_;
+      }
+      const int chunk_embed_samples = static_cast<int>(chunk_for_fbank.size());
+      const int min_nf_seg =
+          embedding_exclude_overlap_
+              ? static_cast<int>(std::ceil(static_cast<double>(F) * static_cast<double>(min_num_samples_) /
+                                           static_cast<double>(chunk_embed_samples)))
+              : -1;
+      int Tf = 0;
+      int Mfb = 0;
+      std::vector<float> fbank_all;
+      pyannote::fbank::wespeaker_like_fbank(
+          static_cast<float>(wav_sr_use),
+          embed_mel_bins_,
+          embed_frame_length_ms_,
+          embed_frame_shift_ms_,
+          chunk_for_fbank.data(),
+          static_cast<int>(chunk_for_fbank.size()),
+          fbank_all,
+          Tf,
+          Mfb);
+      if (Tf < 1 || Mfb != embed_mel_bins_) {
+        throw std::runtime_error("embedding fbank: unexpected frames or mel dimension");
+      }
+      for (int sp = 0; sp < Kcls; ++sp) {
+        std::vector<float> clean_col(static_cast<size_t>(F), 0.f);
+        std::vector<float> full_col(static_cast<size_t>(F), 0.f);
+        for (int f = 0; f < F; ++f) {
+          float rowsum = 0.f;
+          for (int j = 0; j < Kcls; ++j) {
+            rowsum += binarized[static_cast<size_t>((static_cast<size_t>(ci) * static_cast<size_t>(F) +
+                                                     static_cast<size_t>(f)) *
+                                                        static_cast<size_t>(Kcls) +
+                                                    static_cast<size_t>(j))];
+          }
+          const float overlap_ok = (rowsum < 2.f - 1e-5f) ? 1.f : 0.f;
+          const float v =
+              binarized[static_cast<size_t>((static_cast<size_t>(ci) * static_cast<size_t>(F) +
+                                             static_cast<size_t>(f)) *
+                                                static_cast<size_t>(Kcls) +
+                                            static_cast<size_t>(sp))];
+          full_col[static_cast<size_t>(f)] = v;
+          clean_col[static_cast<size_t>(f)] = v * overlap_ok;
+        }
+        float sum_clean = 0.f;
+        for (int f = 0; f < F; ++f) {
+          if (clean_col[static_cast<size_t>(f)] > 0.5f) {
+            sum_clean += 1.f;
+          }
+        }
+        const bool prefer_clean =
+            (min_nf_seg < 0) ? true : (sum_clean > static_cast<float>(min_nf_seg));
+        const std::vector<float>& src = prefer_clean ? clean_col : full_col;
+        float* dst = &emb[(static_cast<size_t>(ci) * static_cast<size_t>(Kcls) + static_cast<size_t>(sp)) *
+                          static_cast<size_t>(dim)];
+        // ONNX ``weights`` time axis matches segmentation frames ``F`` (see golden
+        // ``embedding_chunk0_spk0_ort.npz``); the graph resizes internally. Matches Torch
+        // ``resnet(fbank, weights=...)`` / golden ``embeddings.npz``, unlike
+        // ``ONNXWeSpeakerPretrainedSpeakerEmbedding.__call__`` which strips masked fbank rows
+        // before ORT.
+        embedding_ort::run_embedding_ort(
+            *embed_session_,
+            mem_,
+            alloc_,
+            embed_inputs_fbank_then_weights_,
+            fbank_all.data(),
+            Tf,
+            Mfb,
+            src.data(),
+            F,
+            dst,
+            dim);
+      }
+    }
+    if (parity::env_parity_level() >= 1) {
+      const size_t nemb =
+          static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim);
+      int nan_ct = 0;
+      for (size_t i = 0; i < nemb; ++i) {
+        if (std::isnan(emb[i])) {
+          ++nan_ct;
+        }
+      }
+      std::ostringstream oss;
+      oss << "emb ORT C=" << C << " Kcls=" << Kcls << " dim=" << dim << " nan_count=" << nan_ct
+          << " fp=" << parity::fingerprint_float32(emb.data(), nemb);
+      parity::log_light(oss.str());
+    }
+    clustering_vbx::vbx_clustering_hard(
+        *plda_model_, vbx_params_, C, F, Kcls, dim, emb.data(), binarized.data(), hard_clusters_row);
+    hptr = hard_clusters_row.data();
+  }
+
+  double seg_ss = 0.;
+  double seg_sd = chunk_dur_sec;
+  double seg_st = chunk_step_sec;
+
+  int Tcnt = 0;
+  std::vector<std::uint8_t> cnt_u8 = speaker_count_initial_uint8(
+      binarized,
+      static_cast<size_t>(C),
+      static_cast<size_t>(F),
+      static_cast<size_t>(Kcls),
+      seg_ss,
+      seg_st,
+      seg_sd,
+      rf_dur_,
+      rf_step_,
+      Tcnt);
+  std::uint8_t max_cnt = 0;
+  for (std::uint8_t v : cnt_u8) {
+    max_cnt = std::max(max_cnt, v);
+  }
+  if (max_cnt == 0) {
+    return {};
+  }
+  int max_cap = INT_MAX;
+  if (!golden_bounds_path_.empty()) {
+    const std::string bj = read_text(golden_bounds_path_);
+    std::regex re("\"max_speakers\"\\s*:\\s*(null|[-+0-9]+)");
+    std::smatch m;
+    if (std::regex_search(bj, m, re) && m[1].str() != "null") {
+      max_cap = std::stoi(m[1].str());
+    }
+  }
+  std::vector<std::int8_t> count_i8 = cap_count(cnt_u8, max_cap);
+
+  // Match ``SpeakerDiarization.apply`` behavior: instantaneous count should not exceed the
+  // number of global speakers implied by ``hard_clusters`` (``np.max(hard_clusters) + 1`` in Python).
+  // Otherwise a tiny ORT/Torch segmentation drift can push the per-frame sum to Kcls and inflate
+  // ``max_spf`` inside ``reconstruct_to_diarization``, adding spurious speaker columns beyond
+  // ``label_mapping.json`` (e.g. a third ``SPEAKER_02`` while only two clusters exist).
+  int max_cluster_id = -1;
+  for (int ci = 0; ci < C; ++ci) {
+    for (int j = 0; j < Kcls; ++j) {
+      const int hv = static_cast<int>(hptr[static_cast<size_t>(ci * Kcls + j)]);
+      if (hv >= 0) {
+        max_cluster_id = std::max(max_cluster_id, hv);
+      }
+    }
+  }
+  if (max_cluster_id < 0) {
+    throw std::runtime_error("hard_clusters: no cluster id >= 0");
+  }
+  const int num_detected_speakers = max_cluster_id + 1;
+  for (size_t t = 0; t < count_i8.size(); ++t) {
+    const int v = static_cast<int>(count_i8[t]);
+    count_i8[t] = static_cast<std::int8_t>(std::max(0, std::min(v, num_detected_speakers)));
+  }
+
+  const double onset = 0.5;
+  const double offset = 0.5;
+  const double pad_onset = 0.0;
+  const double pad_offset = 0.0;
+  const bool apply_annotation_support = (min_off_ > 0.0 || pad_onset > 0.0 || pad_offset > 0.0);
+
+  int K_di = 0;
+  const std::vector<float> discrete = reconstruct_to_diarization(
+      seg_out, C, F, Kcls, seg_ss, seg_sd, seg_st, hptr, count_i8, 0.0, rf_dur_, rf_step_, K_di);
+  if (K_di <= 0) {
+    throw std::runtime_error("reconstruct returned non-positive speaker column count");
+  }
+  const int rows = static_cast<int>(discrete.size() / static_cast<size_t>(K_di));
+
+  std::map<int, std::string> label_map = parse_label_mapping(read_text(label_mapping_path_));
+  for (int k = 0; k < K_di; ++k) {
+    if (!label_map.count(k)) {
+      label_map[k] = default_speaker_label(k);
+    }
+  }
+  std::map<int, std::vector<pyannote_port::Segment>> by_label;
+  for (int k = 0; k < K_di; ++k) {
+    std::vector<float> col(static_cast<size_t>(rows));
+    for (int t = 0; t < rows; ++t) {
+      col[static_cast<size_t>(t)] =
+          discrete[static_cast<size_t>(t) * static_cast<size_t>(K_di) + static_cast<size_t>(k)];
+    }
+    std::vector<std::pair<double, double>> regs;
+    binarize_column(
+        col.data(),
+        rows,
+        0.0,
+        rf_dur_,
+        rf_step_,
+        onset,
+        offset,
+        pad_onset,
+        pad_offset,
+        regs);
+    if (!apply_annotation_support) {
+      filter_min_duration_on(regs, min_on_);
+    }
+    for (const auto& pr : regs) {
+      by_label[k].push_back(pyannote_port::Segment{pr.first, pr.second});
+    }
+  }
+
+  std::vector<DiarizationTurn> turns;
+  if (apply_annotation_support) {
+    const auto merged = pyannote_port::annotation_support(by_label, min_off_);
+    for (const auto& pr : merged) {
+      const pyannote_port::Segment& seg = pr.second;
+      if (seg.duration() < min_on_ - 1e-12) {
+        continue;
+      }
+      turns.push_back({seg.start, seg.end, label_map.at(pr.first)});
+    }
+  } else {
+    for (int k = 0; k < K_di; ++k) {
+      for (const pyannote_port::Segment& seg : by_label[k]) {
+        turns.push_back({seg.start, seg.end, label_map.at(k)});
+      }
+    }
+  }
+  std::sort(turns.begin(), turns.end());
+  return turns;
+}
+
+}  // namespace pyannote

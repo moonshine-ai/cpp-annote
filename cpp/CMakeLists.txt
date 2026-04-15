@@ -5,7 +5,27 @@ project(pyannote_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
 include(FetchContent)
+
+# ---- Eigen (header-only) ----------------------------------------------------
+FetchContent_Declare(
+  eigen3
+  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+  GIT_TAG 3.4.0
+)
+FetchContent_GetProperties(eigen3)
+if(NOT eigen3_POPULATED)
+  FetchContent_Populate(eigen3)
+endif()
+
+# Eigen: only MPL2-licensed modules (dense solvers we use remain available).
+add_library(eigen_mpl2 INTERFACE)
+target_compile_definitions(eigen_mpl2 INTERFACE EIGEN_MPL2_ONLY=1)
+target_include_directories(eigen_mpl2 INTERFACE "${eigen3_SOURCE_DIR}")
 
 # ---- cnpy (NPZ / NPY) -------------------------------------------------------
 FetchContent_Declare(
@@ -22,6 +42,19 @@ add_library(cnpy_static STATIC "${cnpy_external_SOURCE_DIR}/cnpy.cpp")
 target_include_directories(cnpy_static PUBLIC "${cnpy_external_SOURCE_DIR}")
 find_package(ZLIB REQUIRED)
 target_link_libraries(cnpy_static PUBLIC ZLIB::ZLIB)
+
+# ---- kaldi-native-fbank (+ kissfft via upstream cmake) ----------------------
+option(PYANNOTE_FETCH_KALDI_NATIVE_FBANK "Fetch and build kaldi-native-fbank + kissfft" ON)
+if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
+  set(KALDI_NATIVE_FBANK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(KALDI_NATIVE_FBANK_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    kaldi_native_fbank
+    GIT_REPOSITORY https://github.com/csukuangfj/kaldi-native-fbank.git
+    GIT_TAG v1.22.3
+  )
+  FetchContent_MakeAvailable(kaldi_native_fbank)
+endif()
 
 # ---- ONNX Runtime (prebuilt SDK) -------------------------------------------
 if(NOT ONNXRUNTIME_ROOT AND DEFINED ENV{ONNXRUNTIME_ROOT})
@@ -65,17 +98,45 @@ if(APPLE)
   target_link_libraries(segmentation_golden_test PRIVATE "-framework Foundation")
 endif()
 
-add_executable(embedding_golden_test tests/embedding_golden_test.cpp)
+add_executable(full_segmentation_window_parity_test tests/full_segmentation_window_parity_test.cpp)
+target_include_directories(full_segmentation_window_parity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_include_directories(full_segmentation_window_parity_test PRIVATE "${ORT_INCLUDE_DIR}")
+target_link_libraries(
+  full_segmentation_window_parity_test PRIVATE cnpy_static "${ORT_LIBRARY}"
+)
+if(APPLE)
+  target_link_libraries(full_segmentation_window_parity_test PRIVATE "-framework Foundation")
+endif()
+
+add_executable(
+  embedding_golden_test
+  tests/embedding_golden_test.cpp
+  port/compute_fbank.cpp
+  port/embedding_ort_infer.cpp
+)
+target_include_directories(embedding_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
 target_include_directories(embedding_golden_test PRIVATE "${ORT_INCLUDE_DIR}")
 target_link_libraries(
   embedding_golden_test PRIVATE cnpy_static "${ORT_LIBRARY}"
 )
+if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
+  target_include_directories(embedding_golden_test PRIVATE "${kaldi_native_fbank_SOURCE_DIR}")
+  target_link_libraries(embedding_golden_test PRIVATE kaldi-native-fbank-core)
+endif()
 if(APPLE)
   target_link_libraries(embedding_golden_test PRIVATE "-framework Foundation")
 endif()
 
 add_executable(speaker_count_golden_test tests/speaker_count_golden_test.cpp)
 target_link_libraries(speaker_count_golden_test PRIVATE cnpy_static)
+
+add_executable(frozen_golden_inputs_test tests/frozen_golden_inputs_test.cpp)
+target_compile_definitions(
+  frozen_golden_inputs_test
+  PRIVATE "PYANNOTE_FROZEN_GOLDEN_UTTERANCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/golden/callhome_eng_idx0/callhome_eng_data_idx0_head120s\""
+          "PYANNOTE_FROZEN_GOLDEN_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/golden/callhome_eng_idx0\""
+)
+target_link_libraries(frozen_golden_inputs_test PRIVATE cnpy_static)
 
 add_executable(reconstruct_golden_test tests/reconstruct_golden_test.cpp)
 target_link_libraries(reconstruct_golden_test PRIVATE cnpy_static)
@@ -84,12 +145,72 @@ add_executable(annotation_golden_test tests/annotation_golden_test.cpp)
 target_include_directories(annotation_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
 target_link_libraries(annotation_golden_test PRIVATE cnpy_static)
 
-add_executable(community1_shortpath tools/community1_shortpath.cpp)
+add_executable(
+  clustering_golden_test
+  tests/clustering_golden_test.cpp
+  port/scipy_linkage.cpp
+  port/filter_train.cpp
+  port/plda_vbx.cpp
+  port/clustering_vbx.cpp
+  port/parity_log.cpp
+)
+target_include_directories(clustering_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_link_libraries(clustering_golden_test PRIVATE cnpy_static eigen_mpl2)
+
+add_executable(vbx_parity_test tests/vbx_parity_test.cpp port/plda_vbx.cpp)
+target_include_directories(vbx_parity_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_link_libraries(vbx_parity_test PRIVATE cnpy_static eigen_mpl2)
+
+add_executable(plda_fea_golden_test tests/plda_fea_golden_test.cpp port/plda_vbx.cpp)
+target_include_directories(plda_fea_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_link_libraries(plda_fea_golden_test PRIVATE cnpy_static eigen_mpl2)
+
+add_executable(
+  linkage_fcluster_golden_test
+  tests/linkage_fcluster_golden_test.cpp
+  port/scipy_linkage.cpp
+)
+target_include_directories(linkage_fcluster_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_link_libraries(linkage_fcluster_golden_test PRIVATE cnpy_static)
+
+add_executable(
+  filter_ahc_golden_test
+  tests/filter_ahc_golden_test.cpp
+  port/filter_train.cpp
+  port/scipy_linkage.cpp
+)
+target_include_directories(filter_ahc_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
+target_link_libraries(filter_ahc_golden_test PRIVATE cnpy_static eigen_mpl2)
+
+add_executable(
+  community1_shortpath
+  tools/community1_shortpath.cpp
+  port/pyannote.cpp
+  port/compute_fbank.cpp
+  port/embedding_ort_infer.cpp
+  port/filter_train.cpp
+  port/clustering_vbx.cpp
+  port/plda_vbx.cpp
+  port/scipy_linkage.cpp
+  port/parity_log.cpp
+)
 target_include_directories(community1_shortpath PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/port")
 target_include_directories(community1_shortpath PRIVATE "${ORT_INCLUDE_DIR}")
-target_link_libraries(community1_shortpath PRIVATE cnpy_static "${ORT_LIBRARY}")
+target_link_libraries(community1_shortpath PRIVATE cnpy_static "${ORT_LIBRARY}" eigen_mpl2)
+if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
+  target_include_directories(community1_shortpath PRIVATE "${kaldi_native_fbank_SOURCE_DIR}")
+  target_link_libraries(community1_shortpath PRIVATE kaldi-native-fbank-core)
+endif()
 if(APPLE)
   target_link_libraries(community1_shortpath PRIVATE "-framework Foundation")
+endif()
+
+if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
+  add_executable(knf_smoke_test tests/knf_smoke_test.cpp)
+  target_include_directories(
+    knf_smoke_test PRIVATE "${kaldi_native_fbank_SOURCE_DIR}"
+  )
+  target_link_libraries(knf_smoke_test PRIVATE kaldi-native-fbank-core)
 endif()
 
 message(STATUS "ONNXRUNTIME_ROOT=${ONNXRUNTIME_ROOT}")

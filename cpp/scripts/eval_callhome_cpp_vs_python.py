@@ -6,8 +6,9 @@
 # Evaluate Diarization Error Rate (DER) on the first n clips from Hugging Face
 # ``diarizers-community/callhome`` (English subset by default): reference labels
 # from dataset timestamps vs (1) full ``SpeakerDiarization`` in Python and
-# (2) C++ ``community1_shortpath`` using oracle clusters from a golden dump of
-# the same pipeline (same configuration as ``dump_diarization_golden.py``).
+# (2) C++ ``community1_shortpath`` either with oracle clusters from a golden dump
+# (``--cpp-mode oracle``) or the full C++ stack including ORT embedding + VBx
+# (``--cpp-mode full``, no ``hard_clusters_final.npz``).
 
 from __future__ import annotations
 
@@ -92,6 +93,21 @@ def _save_wav_row(row: dict[str, Any], path: Path, max_seconds: float) -> float:
     return float(arr.shape[0]) / float(sr)
 
 
+def _hf_embedding_plda_paths(
+    checkpoint: str,
+    revision: str | None,
+    token: str | bool | None,
+) -> tuple[Path, Path]:
+    from huggingface_hub import hf_hub_download
+
+    kw: dict[str, Any] = {"repo_id": checkpoint, "token": token}
+    if revision is not None:
+        kw["revision"] = revision
+    xvec = Path(hf_hub_download(filename="plda/xvec_transform.npz", **kw))
+    plda = Path(hf_hub_download(filename="plda/plda.npz", **kw))
+    return xvec, plda
+
+
 def _json_diarization_to_annotation(path: Path, uri: str) -> Any:
     from pyannote.core import Annotation, Segment
 
@@ -107,7 +123,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "DER on first n CallHome (HF) clips: Python community-1 pipeline vs C++ shortpath "
-            "(oracle clusters from golden dump)."
+            "(oracle clusters or full C++ VBx; see --cpp-mode)."
         )
     )
     ap.add_argument(
@@ -161,16 +177,59 @@ def main() -> None:
         default=_REPO_ROOT / "cpp" / "artifacts" / "community1-segmentation.onnx",
         help="Segmentation ONNX for the C++ short path",
     )
+    ap.add_argument(
+        "--cpp-mode",
+        choices=("oracle", "full"),
+        default="oracle",
+        help="oracle: C++ uses golden hard_clusters (default). full: VBx + ORT embedding, no oracle NPZ.",
+    )
+    ap.add_argument(
+        "--cpp-embedding-onnx",
+        type=Path,
+        default=_REPO_ROOT / "cpp" / "artifacts" / "community1-embedding.onnx",
+        help="Used when --cpp-mode full",
+    )
+    ap.add_argument(
+        "--cpp-xvec",
+        type=Path,
+        default=None,
+        help="xvec_transform.npz for full C++ mode (default: download from --checkpoint)",
+    )
+    ap.add_argument(
+        "--cpp-plda",
+        type=Path,
+        default=None,
+        help="plda.npz for full C++ mode (default: download from --checkpoint)",
+    )
     ap.add_argument("--skip-cpp", action="store_true", help="Skip C++ binary; only Python DER + golden dump")
     ap.add_argument(
         "--skip-dump",
         action="store_true",
         help="Reuse wavs + golden under --work-dir (must already match indices and truncation)",
     )
+    ap.add_argument(
+        "--cpp-clustering-check",
+        action="store_true",
+        help=(
+            "After C++ batch in --cpp-mode full, run clustering_golden_test on the first utterance only "
+            "(requires cpp/build/clustering_golden_test and golden NPZ from the dump)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.num_files < 1:
         raise SystemExit("--num-files must be >= 1")
+
+    if args.cpp_mode == "full":
+        print(
+            "Note (--cpp-mode full): the C++ column runs ORT embeddings + the ported VBx stack in C++; "
+            "the Python column runs Torch embeddings + pyannote's clustering (SciPy/NumPy numerics). "
+            "Those stages are not bit-identical, so ``hard_clusters`` and DER often differ a lot from "
+            "Python even when segmentation and the eval WAV match the golden dump. "
+            "Use ``--cpp-mode oracle`` to check end-to-end parity against the dumped pipeline "
+            "(oracle ``hard_clusters_final.npz`` + same reconstruct path).",
+            flush=True,
+        )
 
     try:
         from datasets import load_dataset
@@ -268,10 +327,51 @@ def main() -> None:
             "--pipeline-snapshot",
             str(snap_json),
         ]
-        if token:
-            pass
-        print("Running C++ batch:", cpp_bin.name, flush=True)
+        xvec_resolved: Path | None = None
+        plda_resolved: Path | None = None
+        if args.cpp_mode == "full":
+            emb_onnx = args.cpp_embedding_onnx.resolve()
+            if not emb_onnx.is_file():
+                raise SystemExit(f"--cpp-mode full requires embedding ONNX: {emb_onnx}")
+            if args.cpp_xvec is not None and args.cpp_plda is not None:
+                xv = args.cpp_xvec.resolve()
+                pl = args.cpp_plda.resolve()
+            else:
+                xv, pl = _hf_embedding_plda_paths(args.checkpoint, args.revision, token)
+            xvec_resolved = xv
+            plda_resolved = pl
+            cmd_cpp.extend(
+                [
+                    "--embedding-onnx",
+                    str(emb_onnx),
+                    "--xvec-transform",
+                    str(xv),
+                    "--plda",
+                    str(pl),
+                ]
+            )
+        print("Running C++ batch:", cpp_bin.name, f"(cpp_mode={args.cpp_mode})", flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
+
+        if (
+            args.cpp_mode == "full"
+            and args.cpp_clustering_check
+            and stems
+            and xvec_resolved is not None
+            and plda_resolved is not None
+        ):
+            clu_bin = cpp_bin.parent / "clustering_golden_test"
+            utter0 = golden_root / stems[0]
+            if clu_bin.is_file() and utter0.is_dir():
+                print(
+                    f"Running clustering_golden_test on first utterance: {utter0.name}",
+                    flush=True,
+                )
+                subprocess.run(
+                    [str(clu_bin), str(utter0), str(xvec_resolved), str(plda_resolved)],
+                    cwd=str(_REPO_ROOT),
+                    check=False,
+                )
 
     if args.device == "auto":
         if torch.cuda.is_available():
@@ -342,7 +442,12 @@ def main() -> None:
     print()
     print("Reference: HF ``timestamps_*`` / ``speakers`` clipped to truncated WAV length.")
     print("Python: full SpeakerDiarization output on each WAV.")
-    print("C++: community1_shortpath with oracle hard_clusters from the golden dump (same checkpoint).")
+    if args.cpp_mode == "oracle":
+        print("C++: community1_shortpath with oracle hard_clusters from the golden dump (same checkpoint).")
+    else:
+        print(
+            "C++: community1_shortpath full pipeline (segmentation + ORT embedding + VBx; no oracle clusters NPZ)."
+        )
 
 
 if __name__ == "__main__":

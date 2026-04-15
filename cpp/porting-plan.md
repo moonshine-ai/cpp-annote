@@ -210,6 +210,8 @@ Use **`cpp/scripts/dump_diarization_golden.py`** (or **`scripts/dump_golden.sh`*
 | After `reconstruct` / `to_annotation` | `discrete_diarization_*.npz`, `diarization.json`, **`label_mapping.json`** | **`reconstruct_golden_test`** + **`annotation_golden_test`** |
 | Root | `manifest.json`, `pipeline_snapshot.json`, `receptive_field.json` | Versions and hyperparameters |
 
+For closing the **embedding + VBx** gap vs Python in `--cpp-mode full` (logging, ordered tests, milestones), see **`cpp/embedding-vbx-parity-plan.md`**. Milestone 0 (frozen NPZ layout) is enforced by **`cpp/build/frozen_golden_inputs_test`**.
+
 ---
 
 ## 12. Configuration surface (must match Python defaults)
