@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 // CLI for diarization; core logic lives in ``src/cpp-annote.h`` (class ``pyannote::CppAnnote``).
-// Default mode simulates streaming (``StreamingDiarizationSession``); ``--batch`` uses the
-// original whole-file ``diarize`` path for deterministic offline results.
+// All diarization runs through ``StreamingDiarizationSession``; for offline / whole-file use,
+// a large ``--refresh-every`` value defers clustering to the single ``end_session`` call.
 
-#include <chrono>
-#include <cstdint>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -14,7 +13,6 @@
 #include <string>
 #include <vector>
 
-#include "cpp-annote.h"
 #include "cpp-annote-streaming.h"
 #include "wav_pcm_float32.h"
 
@@ -150,70 +148,7 @@ static void print_timing(const char* tag, const std::string& path, double audio_
   std::cout << buf;
 }
 
-static void run_batch(pyannote::CppAnnote& engine, const std::vector<DiarJob>& jobs, bool continue_on_error) {
-  int n_fail = 0;
-  double total_audio_sec = 0.;
-  double total_wall_sec = 0.;
-  for (std::size_t i = 0; i < jobs.size(); ++i) {
-    try {
-      const DiarJob& job = jobs[i];
-      if (!job.golden_bounds.empty()) {
-        engine.set_golden_speaker_bounds(job.golden_bounds);
-      } else {
-        engine.set_golden_speaker_bounds("");
-      }
-
-      int wav_sr = 0;
-      std::vector<float> mono = wav_pcm::load_wav_pcm16_mono_float32(job.wav, wav_sr);
-      const double audio_sec = wav_sr > 0
-          ? static_cast<double>(mono.size()) / static_cast<double>(wav_sr) : 0.;
-      const fs::path outp(job.out);
-      const fs::path parent = outp.parent_path();
-      if (!parent.empty()) {
-        fs::create_directories(parent);
-      }
-      const auto t0 = std::chrono::steady_clock::now();
-      pyannote::DiarizationProfile prof;
-      std::vector<float> resampled =
-          wav_pcm::linear_resample(mono, wav_sr, engine.segmentation_model_sample_rate());
-      std::vector<pyannote::DiarizationTurn> turns =
-          engine.diarize_mono_model_sr(std::move(resampled), prof);
-      const auto t1 = std::chrono::steady_clock::now();
-      const double wall_sec =
-          std::chrono::duration<double>(t1 - t0).count();
-      pyannote::write_diarization_json(job.out, turns);
-
-      total_audio_sec += audio_sec;
-      total_wall_sec += wall_sec;
-
-      if (turns.empty()) {
-        std::cout << "[batch] Wrote empty diarization -> " << job.out << "\n";
-      } else {
-        std::cout << "[batch] Wrote " << job.out << " (" << turns.size() << " turns)\n";
-      }
-      print_timing("batch", job.wav, audio_sec, wall_sec);
-      prof.print(std::cerr, "  [batch] ");
-    } catch (const std::exception& e) {
-      std::cerr << "ERROR";
-      if (jobs.size() > 1) {
-        std::cerr << " [" << (i + 1) << "/" << jobs.size() << "] " << jobs[i].wav;
-      }
-      std::cerr << ": " << e.what() << "\n";
-      ++n_fail;
-      if (!continue_on_error) {
-        throw;
-      }
-    }
-  }
-  if (jobs.size() > 1) {
-    print_timing("batch total", std::to_string(jobs.size()) + " files", total_audio_sec, total_wall_sec);
-  }
-  if (n_fail > 0) {
-    throw std::runtime_error(std::to_string(n_fail) + " job(s) failed");
-  }
-}
-
-static void run_streaming(pyannote::CppAnnote& engine,
+static void run_diarize(pyannote::CppAnnote& engine,
                           const std::vector<DiarJob>& jobs,
                           double refresh_every_sec,
                           bool continue_on_error) {
@@ -266,12 +201,12 @@ static void run_streaming(pyannote::CppAnnote& engine,
       total_wall_sec += wall_sec;
 
       if (snap.turns.empty()) {
-        std::cout << "[streaming] Wrote empty diarization -> " << job.out << "\n";
+        std::cout << "[diarize] Wrote empty diarization -> " << job.out << "\n";
       } else {
-        std::cout << "[streaming] Wrote " << job.out << " (" << snap.turns.size() << " turns, "
+        std::cout << "[diarize] Wrote " << job.out << " (" << snap.turns.size() << " turns, "
                   << snap.refresh_generation << " refreshes)\n";
       }
-      print_timing("streaming", job.wav, audio_sec, wall_sec);
+      print_timing("diarize", job.wav, audio_sec, wall_sec);
     } catch (const std::exception& e) {
       std::cerr << "ERROR";
       if (jobs.size() > 1) {
@@ -285,7 +220,7 @@ static void run_streaming(pyannote::CppAnnote& engine,
     }
   }
   if (jobs.size() > 1) {
-    print_timing("streaming total", std::to_string(jobs.size()) + " files", total_audio_sec, total_wall_sec);
+    print_timing("diarize total", std::to_string(jobs.size()) + " files", total_audio_sec, total_wall_sec);
   }
   if (n_fail > 0) {
     throw std::runtime_error(std::to_string(n_fail) + " job(s) failed");
@@ -296,32 +231,31 @@ int main(int argc, char** argv) {
   if (argc < 2 || has_flag(argc, argv, "--help")) {
     std::cerr
         << "cpp-annote-cli — WAV + segmentation ORT + ORT embedding + VBx -> diarization JSON.\n\n"
-        << "By default uses the streaming path (feeds audio in chunks, periodic VBx refresh).\n"
-        << "Pass --batch to use the original whole-file diarize path.\n\n"
+        << "Audio is fed through a streaming session that caches ORT results incrementally\n"
+        << "and runs VBx clustering on a configurable cadence.\n\n"
         << "Required for every run:\n"
         << "  --segmentation-onnx PATH   (metadata: same stem .json)\n"
         << "  --embedding-onnx PATH      community1-embedding.onnx (+ same-stem .json)\n\n"
         << "Single file:\n"
         << "  --wav PATH\n"
         << "  --out PATH                 output diarization.json\n\n"
-        << "Batch — tab-separated manifest (one job per line, # comments OK):\n"
+        << "Multi-file — tab-separated manifest (one job per line, # comments OK):\n"
         << "  --manifest PATH\n"
         << "    1 field:   wav   (requires --out-dir -> OUT/<wav_stem>.json)\n"
         << "    2 fields:  wav<TAB>out.json\n"
         << "    3 fields:  wav<TAB>golden_speaker_bounds.json<TAB>out.json\n"
         << "  --out-dir PATH             required for 1-column manifest lines; also for --wav-list\n\n"
-        << "Batch — one WAV path per line:\n"
+        << "Multi-file — one WAV path per line:\n"
         << "  --wav-list PATH            requires --out-dir; writes OUT/<stem>.json per line\n\n"
-        << "Mode:\n"
-        << "  --batch                    whole-file diarize (original path)\n"
-        << "  --refresh-every N          streaming: re-cluster every N seconds of new audio (default 2.0)\n\n"
+        << "Tuning:\n"
+        << "  --refresh-every N          re-cluster every N seconds of new audio (default 2.0)\n\n"
         << "Optional overrides (defaults compiled into the binary from export_cpp_annote_embedded.py):\n"
         << "  --receptive-field PATH         receptive_field.json\n"
         << "  --pipeline-snapshot PATH       pipeline_snapshot.json\n"
         << "  --golden-speaker-bounds PATH   default max_speakers cap when a job omits per-utterance bounds\n"
         << "  --xvec-transform PATH          xvec_transform.npz (must pair with --plda)\n"
         << "  --plda PATH                    plda.npz\n"
-        << "  --continue-on-error            batch only: print error and continue; exit 1 if any failed\n";
+        << "  --continue-on-error            print error and continue; exit 1 if any failed\n";
     return 2;
   }
   try {
@@ -337,7 +271,6 @@ int main(int argc, char** argv) {
     const std::string xvec_npz = get_arg(argc, argv, "--xvec-transform");
     const std::string plda_npz = get_arg(argc, argv, "--plda");
     const bool continue_on_error = has_flag(argc, argv, "--continue-on-error");
-    const bool batch_mode = has_flag(argc, argv, "--batch");
 
     const std::string refresh_str = get_arg(argc, argv, "--refresh-every");
     const double refresh_every_sec = refresh_str.empty() ? 2.0 : std::stod(refresh_str);
@@ -387,11 +320,7 @@ int main(int argc, char** argv) {
         xvec_npz,
         plda_npz);
 
-    if (batch_mode) {
-      run_batch(engine, jobs, continue_on_error);
-    } else {
-      run_streaming(engine, jobs, refresh_every_sec, continue_on_error);
-    }
+    run_diarize(engine, jobs, refresh_every_sec, continue_on_error);
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return 1;

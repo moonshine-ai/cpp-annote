@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// C++ short-path diarization: community-1 segmentation ORT, then VBx clustering
-// (ORT embedding + PLDA) in ``diarize``.
+// C++ diarization engine: community-1 segmentation ORT + embedding ORT + VBx (PLDA).
+// Per-chunk building blocks are public for ``StreamingDiarizationSession``.
 
 #pragma once
 
@@ -72,8 +72,8 @@ struct DiarizationTurn {
 
 /// Loads segmentation ONNX and embedding ONNX once. When optional paths are empty, community-1
 /// defaults compiled from ``export_cpp_annote_embedded.py`` are used (receptive field, pipeline snapshot,
-/// golden speaker bounds, ``xvec_transform`` / ``plda`` tensors). Cluster assignments are produced via VBx
-/// in ``diarize``.
+/// golden speaker bounds, ``xvec_transform`` / ``plda`` tensors). Use via
+/// ``StreamingDiarizationSession`` (see ``cpp-annote-streaming.h``).
 class CppAnnote {
  public:
   /// ``embedding_onnx_path`` must be non-empty. Leave ``receptive_field_json_path``,
@@ -93,17 +93,6 @@ class CppAnnote {
   CppAnnote& operator=(const CppAnnote&) = delete;
   CppAnnote(CppAnnote&&) = delete;
   CppAnnote& operator=(CppAnnote&&) = delete;
-
-  /// Mono PCM32-ish samples at ``sample_rate`` Hz; resampled internally to the model rate.
-  std::vector<DiarizationTurn> diarize(std::vector<float> audio_data, std::int32_t sample_rate);
-
-  /// Same as ``diarize`` but waveform is already mono at ``segmentation_model_sample_rate()`` Hz
-  /// (``cfg`` sidecar ``sample_rate``). Used by streaming and parity tooling.
-  std::vector<DiarizationTurn> diarize_mono_model_sr(std::vector<float> waveform_model_sr);
-
-  /// Variant that also fills a ``DiarizationProfile`` with per-stage wall times.
-  std::vector<DiarizationTurn> diarize_mono_model_sr(std::vector<float> waveform_model_sr,
-                                                     DiarizationProfile& profile);
 
   // ---- Per-chunk building blocks (used by streaming cache) -----------------
 
@@ -196,7 +185,5 @@ class CppAnnote {
   std::unique_ptr<plda_vbx::PldaModel> plda_model_;
   clustering_vbx::VbxClusteringParams vbx_params_{};
 };
-
-void write_diarization_json(const std::string& path, const std::vector<DiarizationTurn>& turns);
 
 }  // namespace pyannote

@@ -207,31 +207,6 @@ if(APPLE)
   target_link_libraries(cpp-annote-cli PRIVATE "-framework Foundation")
 endif()
 
-add_executable(
-  streaming_vs_batch_test
-  tools/streaming_vs_batch_test.cpp
-  src/cpp-annote.cpp
-  src/cpp-annote-streaming.cpp
-  src/community1_cpp_annote_embedded.cpp
-  src/compute_fbank.cpp
-  src/embedding_ort_infer.cpp
-  src/filter_train.cpp
-  src/clustering_vbx.cpp
-  src/plda_vbx.cpp
-  src/scipy_linkage.cpp
-  src/parity_log.cpp
-)
-target_include_directories(streaming_vs_batch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_include_directories(streaming_vs_batch_test PRIVATE "${ORT_INCLUDE_DIR}")
-target_link_libraries(streaming_vs_batch_test PRIVATE cnpy_static "${ORT_LIBRARY}" eigen_mpl2)
-if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
-  target_include_directories(streaming_vs_batch_test PRIVATE "${kaldi_native_fbank_SOURCE_DIR}")
-  target_link_libraries(streaming_vs_batch_test PRIVATE kaldi-native-fbank-core)
-endif()
-if(APPLE)
-  target_link_libraries(streaming_vs_batch_test PRIVATE "-framework Foundation")
-endif()
-
 if(PYANNOTE_FETCH_KALDI_NATIVE_FBANK)
   add_executable(knf_smoke_test tests/knf_smoke_test.cpp)
   target_include_directories(

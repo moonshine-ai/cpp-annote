@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <climits>
@@ -31,21 +30,6 @@
 #include "community1_cpp_annote_embedded.h"
 
 namespace pyannote {
-namespace detail {
-
-std::string json_escape(const std::string& s) {
-  std::string o;
-  for (char c : s) {
-    if (c == '"' || c == '\\') {
-      o += '\\';
-    }
-    o += c;
-  }
-  return o;
-}
-
-}  // namespace detail
-
 namespace {
 
 std::string read_text(const std::string& p) {
@@ -543,25 +527,6 @@ std::string default_speaker_label(int k) {
 
 }  // namespace
 
-void write_diarization_json(const std::string& path, const std::vector<DiarizationTurn>& turns) {
-  std::ofstream f(path);
-  if (!f) {
-    throw std::runtime_error("write failed: " + path);
-  }
-  f << std::setprecision(17);
-  f << "[\n";
-  for (size_t i = 0; i < turns.size(); ++i) {
-    const DiarizationTurn& t = turns[i];
-    f << "  {\"start\": " << t.start << ", \"end\": " << t.end << ", \"speaker\": \"" << detail::json_escape(t.speaker)
-      << "\"}";
-    if (i + 1 < turns.size()) {
-      f << ",";
-    }
-    f << "\n";
-  }
-  f << "]\n";
-}
-
 CppAnnote::CppAnnote(
     std::string segmentation_onnx_path,
     std::string receptive_field_json_path,
@@ -966,110 +931,6 @@ std::vector<DiarizationTurn> CppAnnote::cluster_and_decode(
   profile.total_chunks = C;
   profile.num_frames = F;
   profile.num_classes = Kcls;
-  return turns;
-}
-
-// ---------------------------------------------------------------------------
-// Full-file entry points
-// ---------------------------------------------------------------------------
-
-std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, std::int32_t sample_rate) {
-  std::vector<float> audio =
-      wav_pcm::linear_resample(audio_data, static_cast<int>(sample_rate), cfg_.sr_model);
-  return diarize_mono_model_sr(std::move(audio));
-}
-
-std::vector<DiarizationTurn> CppAnnote::diarize_mono_model_sr(std::vector<float> audio) {
-  DiarizationProfile unused_profile;
-  return diarize_mono_model_sr(std::move(audio), unused_profile);
-}
-
-std::vector<DiarizationTurn> CppAnnote::diarize_mono_model_sr(std::vector<float> audio,
-                                                               DiarizationProfile& profile) {
-  using Clock = std::chrono::steady_clock;
-  const auto t_start = Clock::now();
-
-  const int sr_model = cfg_.sr_model;
-  const int num_channels = cfg_.num_channels;
-  const int chunk_num_samples = cfg_.chunk_num_samples;
-  const double chunk_step_sec = cfg_.chunk_step_sec;
-
-  const int step_samples = static_cast<int>(std::lrint(chunk_step_sec * static_cast<double>(sr_model)));
-  if (step_samples <= 0 || chunk_num_samples <= 0) {
-    throw std::runtime_error("bad chunk/step samples");
-  }
-
-  const int64_t num_samples = static_cast<int64_t>(audio.size());
-  int64_t num_chunks = 0;
-  if (num_samples >= chunk_num_samples) {
-    num_chunks = (num_samples - chunk_num_samples) / step_samples + 1;
-  }
-  const bool has_last =
-      (num_samples < chunk_num_samples) || ((num_samples - chunk_num_samples) % step_samples > 0);
-  const int64_t total_chunks = num_chunks + (has_last ? 1 : 0);
-  if (total_chunks <= 0) {
-    profile = DiarizationProfile{};
-    return {};
-  }
-
-  const int C = static_cast<int>(total_chunks);
-  const int FK_stride = [&]() -> int {
-    // Run first chunk to discover F and K.
-    auto buf0 = extract_chunk_audio(audio.data(), num_samples, 0, chunk_num_samples, num_channels);
-    auto s0 = run_segmentation_ort_single(buf0.data());
-    return seg_F_ * seg_K_;
-  }();
-  const int F = seg_F_;
-  const int Kcls = seg_K_;
-  const int dim = embed_dim_;
-
-  std::vector<float> seg_out(static_cast<size_t>(C) * static_cast<size_t>(FK_stride));
-  std::vector<float> emb(
-      static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim),
-      std::numeric_limits<float>::quiet_NaN());
-
-  // Segmentation pass — chunk 0 was already run above, but re-run for simplicity (cheap vs embedding).
-  for (int64_t c = 0; c < total_chunks; ++c) {
-    const int64_t off = (c < num_chunks) ? c * step_samples : num_chunks * step_samples;
-    auto buf = extract_chunk_audio(audio.data(), num_samples, off, chunk_num_samples, num_channels);
-    auto seg = run_segmentation_ort_single(buf.data());
-    std::memcpy(&seg_out[static_cast<size_t>(c) * static_cast<size_t>(FK_stride)],
-                seg.data(), static_cast<size_t>(FK_stride) * sizeof(float));
-  }
-
-  const auto t_after_seg = Clock::now();
-
-  // Embedding pass
-  for (int64_t c = 0; c < total_chunks; ++c) {
-    const int64_t off = (c < num_chunks) ? c * step_samples : num_chunks * step_samples;
-    auto mono = extract_chunk_audio(audio.data(), num_samples, off, chunk_num_samples, 1);
-    const float* seg_ptr = &seg_out[static_cast<size_t>(c) * static_cast<size_t>(FK_stride)];
-    auto chunk_emb = run_embedding_ort_single(mono.data(), seg_ptr);
-    std::memcpy(&emb[static_cast<size_t>(c) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim)],
-                chunk_emb.data(),
-                static_cast<size_t>(Kcls) * static_cast<size_t>(dim) * sizeof(float));
-  }
-
-  if (parity::env_parity_level() >= 1) {
-    const size_t nemb = static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim);
-    int nan_ct = 0;
-    for (size_t i = 0; i < nemb; ++i) {
-      if (std::isnan(emb[i])) { ++nan_ct; }
-    }
-    std::ostringstream oss;
-    oss << "emb ORT C=" << C << " Kcls=" << Kcls << " dim=" << dim << " nan_count=" << nan_ct
-        << " fp=" << parity::fingerprint_float32(emb.data(), nemb);
-    parity::log_light(oss.str());
-  }
-
-  const auto t_after_emb = Clock::now();
-
-  auto turns = cluster_and_decode(seg_out, emb, C, profile);
-
-  const auto t_end = Clock::now();
-  profile.segmentation_ort_sec = std::chrono::duration<double>(t_after_seg - t_start).count();
-  profile.embedding_ort_sec = std::chrono::duration<double>(t_after_emb - t_after_seg).count();
-  profile.total_sec = std::chrono::duration<double>(t_end - t_start).count();
   return turns;
 }
 
