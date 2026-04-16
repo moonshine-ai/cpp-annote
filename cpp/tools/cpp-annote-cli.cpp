@@ -215,11 +215,10 @@ static void run_batch(pyannote::CppAnnote& engine, const std::vector<DiarJob>& j
 
 static void run_streaming(pyannote::CppAnnote& engine,
                           const std::vector<DiarJob>& jobs,
-                          double chunk_seconds,
-                          int refresh_every_chunks,
+                          double refresh_every_sec,
                           bool continue_on_error) {
   pyannote::StreamingDiarizationConfig cfg;
-  cfg.refresh_every_new_chunks = refresh_every_chunks;
+  cfg.refresh_every_sec = refresh_every_sec;
 
   int n_fail = 0;
   double total_audio_sec = 0.;
@@ -246,8 +245,9 @@ static void run_streaming(pyannote::CppAnnote& engine,
       pyannote::StreamingDiarizationSession sess(engine, cfg);
       sess.start_session();
 
+      constexpr double kSimChunkSec = 1.0;
       const std::size_t chunk_samples =
-          static_cast<std::size_t>(std::max(1., chunk_seconds * static_cast<double>(wav_sr)));
+          static_cast<std::size_t>(std::max(1., kSimChunkSec * static_cast<double>(wav_sr)));
       const auto t0 = std::chrono::steady_clock::now();
       std::size_t offset = 0;
       while (offset < mono.size()) {
@@ -314,8 +314,7 @@ int main(int argc, char** argv) {
         << "  --wav-list PATH            requires --out-dir; writes OUT/<stem>.json per line\n\n"
         << "Mode:\n"
         << "  --batch                    whole-file diarize (original path)\n"
-        << "  --chunk-seconds N          streaming: simulated chunk size in seconds (default 1.0)\n"
-        << "  --refresh-every-chunks N   streaming: run cluster/decode every N new analysis chunks (default 2)\n\n"
+        << "  --refresh-every N          streaming: re-cluster every N seconds of new audio (default 2.0)\n\n"
         << "Optional overrides (defaults compiled into the binary from export_cpp_annote_embedded.py):\n"
         << "  --receptive-field PATH         receptive_field.json\n"
         << "  --pipeline-snapshot PATH       pipeline_snapshot.json\n"
@@ -340,10 +339,8 @@ int main(int argc, char** argv) {
     const bool continue_on_error = has_flag(argc, argv, "--continue-on-error");
     const bool batch_mode = has_flag(argc, argv, "--batch");
 
-    const std::string chunk_sec_str = get_arg(argc, argv, "--chunk-seconds");
-    const double chunk_seconds = chunk_sec_str.empty() ? 1.0 : std::stod(chunk_sec_str);
-    const std::string refresh_str = get_arg(argc, argv, "--refresh-every-chunks");
-    const int refresh_every_chunks = refresh_str.empty() ? 2 : std::stoi(refresh_str);
+    const std::string refresh_str = get_arg(argc, argv, "--refresh-every");
+    const double refresh_every_sec = refresh_str.empty() ? 2.0 : std::stod(refresh_str);
 
     if (embed_onnx.empty()) {
       throw std::runtime_error("missing --embedding-onnx (see --help)");
@@ -393,7 +390,7 @@ int main(int argc, char** argv) {
     if (batch_mode) {
       run_batch(engine, jobs, continue_on_error);
     } else {
-      run_streaming(engine, jobs, chunk_seconds, refresh_every_chunks, continue_on_error);
+      run_streaming(engine, jobs, refresh_every_sec, continue_on_error);
     }
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";

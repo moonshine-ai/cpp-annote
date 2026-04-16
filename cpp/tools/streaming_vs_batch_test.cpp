@@ -118,8 +118,7 @@ int main(int argc, char** argv) {
         << "  --embedding-onnx PATH\n\n"
         << "Optional:\n"
         << "  --golden-speaker-bounds PATH\n"
-        << "  --chunk-seconds N            streaming simulated chunk (default 1.0)\n"
-        << "  --refresh-every-chunks N     streaming cluster/decode cadence (default 999999 = once at end)\n";
+        << "  --refresh-every N            re-cluster every N seconds of new audio (default 999999 = once at end)\n";
     return 2;
   }
 
@@ -128,10 +127,8 @@ int main(int argc, char** argv) {
     const std::string emb_onnx = get_arg(argc, argv, "--embedding-onnx");
     const std::string wav_path = get_arg(argc, argv, "--wav");
     const std::string bounds_path = get_arg(argc, argv, "--golden-speaker-bounds");
-    const std::string chunk_str = get_arg(argc, argv, "--chunk-seconds");
-    const double chunk_sec = chunk_str.empty() ? 1.0 : std::stod(chunk_str);
-    const std::string ref_str = get_arg(argc, argv, "--refresh-every-chunks");
-    const int refresh_every = ref_str.empty() ? 999999 : std::stoi(ref_str);
+    const std::string ref_str = get_arg(argc, argv, "--refresh-every");
+    const double refresh_every_sec = ref_str.empty() ? 999999.0 : std::stod(ref_str);
 
     if (seg_onnx.empty() || emb_onnx.empty() || wav_path.empty()) {
       throw std::runtime_error("--wav, --segmentation-onnx, and --embedding-onnx are required");
@@ -154,10 +151,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "  batch resampled: %zu samples at %d Hz\n", batch_resampled.size(), sr_model);
 
     // Simulate streaming resampling: chunk-by-chunk like add_audio_chunk does.
+    constexpr double kSimChunkSec = 1.0;
     std::vector<float> streaming_resampled;
     {
       const size_t chunk_samples = static_cast<size_t>(
-          std::max(1., chunk_sec * static_cast<double>(wav_sr)));
+          std::max(1., kSimChunkSec * static_cast<double>(wav_sr)));
       size_t offset = 0;
       while (offset < raw_audio.size()) {
         const size_t n = std::min(chunk_samples, raw_audio.size() - offset);
@@ -313,11 +311,11 @@ int main(int argc, char** argv) {
         std::vector<float>(batch_resampled), batch_prof);
 
     pyannote::StreamingDiarizationConfig cfg;
-    cfg.refresh_every_new_chunks = refresh_every;
+    cfg.refresh_every_sec = refresh_every_sec;
     pyannote::StreamingDiarizationSession sess(engine, cfg);
     sess.start_session();
     const size_t feed_samples = static_cast<size_t>(
-        std::max(1., chunk_sec * static_cast<double>(wav_sr)));
+        std::max(1., kSimChunkSec * static_cast<double>(wav_sr)));
     size_t off = 0;
     while (off < raw_audio.size()) {
       const size_t n = std::min(feed_samples, raw_audio.size() - off);

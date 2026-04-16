@@ -45,7 +45,11 @@ double segment_iou(double a0, double a1, double b0, double b1) {
 
 StreamingDiarizationSession::StreamingDiarizationSession(CppAnnote& engine, StreamingDiarizationConfig config)
     : engine_(engine), cfg_(std::move(config)) {
-  cfg_.refresh_every_new_chunks = std::max(1, cfg_.refresh_every_new_chunks);
+  cfg_.refresh_every_sec = std::max(0.0, cfg_.refresh_every_sec);
+  const double step = engine_.segmentation_chunk_step_sec();
+  refresh_every_chunks_ = (step > 0.0)
+      ? std::max(1, static_cast<int>(std::lrint(cfg_.refresh_every_sec / step)))
+      : 1;
 }
 
 void StreamingDiarizationSession::start_session() {
@@ -55,7 +59,6 @@ void StreamingDiarizationSession::start_session() {
   buffer_abs_start_samples_ = 0;
   chunk_cache_.clear();
   last_refresh_total_chunks_ = -1;
-  last_refresh_at_input_end_.reset();
   cumulative_profile_ = DiarizationProfile{};
   refresh_count_ = 0;
   snapshot_ = StreamingDiarizationSnapshot{};
@@ -201,12 +204,7 @@ void StreamingDiarizationSession::maybe_refresh(bool force) {
 
   if (!force) {
     if (last_refresh_total_chunks_ >= 0) {
-      if (total_chunks_ever < last_refresh_total_chunks_ + cfg_.refresh_every_new_chunks) {
-        return;
-      }
-    }
-    if (last_refresh_at_input_end_.has_value()) {
-      if (input_end_sec_ - *last_refresh_at_input_end_ < cfg_.refresh_min_interval_sec) {
+      if (total_chunks_ever < last_refresh_total_chunks_ + refresh_every_chunks_) {
         return;
       }
     }
@@ -313,7 +311,6 @@ void StreamingDiarizationSession::maybe_refresh(bool force) {
   ++snapshot_.refresh_generation;
 
   last_refresh_total_chunks_ = static_cast<int>(total_chunks_ever);
-  last_refresh_at_input_end_ = input_end_sec_;
 }
 
 StreamingDiarizationSnapshot StreamingDiarizationSession::snapshot() const {

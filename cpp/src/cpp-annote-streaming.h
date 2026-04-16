@@ -8,7 +8,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,11 +15,9 @@
 namespace pyannote {
 
 struct StreamingDiarizationConfig {
-  /// Run VBx + decode only after this many new analysis chunks since the last refresh (chunking
-  /// matches ``CppAnnote::diarize`` sliding windows at model rate).
-  int refresh_every_new_chunks = 2;
-  /// Minimum wall time between VBx refreshes, in seconds of **ingested media** (``input_end_sec``).
-  double refresh_min_interval_sec = 0.5;
+  /// Minimum seconds of new audio between VBx refreshes.  Converted internally to an
+  /// analysis-chunk count using the model's ``chunk_step_sec``.
+  double refresh_every_sec = 2.0;
 };
 
 struct StreamingDiarizationTurn : DiarizationTurn {
@@ -75,6 +72,7 @@ class StreamingDiarizationSession {
 
   CppAnnote& engine_;
   StreamingDiarizationConfig cfg_{};
+  int refresh_every_chunks_ = 1;  // derived from cfg_.refresh_every_sec / chunk_step_sec
 
   std::vector<float> buffer_;
   double input_end_sec_ = 0.;
@@ -84,7 +82,6 @@ class StreamingDiarizationSession {
   std::unordered_map<int64_t, CachedChunk> chunk_cache_;
 
   int last_refresh_total_chunks_ = -1;
-  std::optional<double> last_refresh_at_input_end_;
 
   DiarizationProfile cumulative_profile_{};
   int refresh_count_ = 0;

@@ -236,10 +236,10 @@ def main() -> None:
         help="Reuse wavs + golden under --work-dir (must already match indices and truncation)",
     )
     ap.add_argument(
-        "--refresh-every-chunks",
-        type=int,
+        "--refresh-every",
+        type=float,
         default=None,
-        help="Streaming: run cluster/decode every N new analysis chunks (passed to cpp-annote-cli)",
+        help="Streaming: re-cluster every N seconds of new audio (passed to cpp-annote-cli)",
     )
     ap.add_argument(
         "--cpp-clustering-check",
@@ -370,8 +370,8 @@ def main() -> None:
             xv, pl = _hf_embedding_plda_paths(args.checkpoint, args.revision, token)
         xvec_resolved = xv
         plda_resolved = pl
-        if args.refresh_every_chunks is not None:
-            cmd_cpp += ["--refresh-every-chunks", str(args.refresh_every_chunks)]
+        if args.refresh_every is not None:
+            cmd_cpp += ["--refresh-every", str(args.refresh_every)]
         print("Running C++ (streaming):", cpp_bin.name, flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
 
