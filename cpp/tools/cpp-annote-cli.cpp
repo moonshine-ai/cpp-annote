@@ -216,11 +216,9 @@ static void run_batch(pyannote::CppAnnote& engine, const std::vector<DiarJob>& j
 static void run_streaming(pyannote::CppAnnote& engine,
                           const std::vector<DiarJob>& jobs,
                           double chunk_seconds,
-                          double max_buffer_seconds,
                           int refresh_every_chunks,
                           bool continue_on_error) {
   pyannote::StreamingDiarizationConfig cfg;
-  cfg.max_buffer_seconds = max_buffer_seconds;
   cfg.refresh_every_new_chunks = refresh_every_chunks;
 
   int n_fail = 0;
@@ -317,7 +315,6 @@ int main(int argc, char** argv) {
         << "Mode:\n"
         << "  --batch                    whole-file diarize (original path)\n"
         << "  --chunk-seconds N          streaming: simulated chunk size in seconds (default 1.0)\n"
-        << "  --max-buffer-seconds N     streaming: max audio buffer kept for VBx (default 120)\n"
         << "  --refresh-every-chunks N   streaming: run cluster/decode every N new analysis chunks (default 2)\n\n"
         << "Optional overrides (defaults compiled into the binary from export_cpp_annote_embedded.py):\n"
         << "  --receptive-field PATH         receptive_field.json\n"
@@ -345,8 +342,6 @@ int main(int argc, char** argv) {
 
     const std::string chunk_sec_str = get_arg(argc, argv, "--chunk-seconds");
     const double chunk_seconds = chunk_sec_str.empty() ? 1.0 : std::stod(chunk_sec_str);
-    const std::string max_buf_str = get_arg(argc, argv, "--max-buffer-seconds");
-    const double max_buffer_seconds = max_buf_str.empty() ? 120.0 : std::stod(max_buf_str);
     const std::string refresh_str = get_arg(argc, argv, "--refresh-every-chunks");
     const int refresh_every_chunks = refresh_str.empty() ? 2 : std::stoi(refresh_str);
 
@@ -398,7 +393,7 @@ int main(int argc, char** argv) {
     if (batch_mode) {
       run_batch(engine, jobs, continue_on_error);
     } else {
-      run_streaming(engine, jobs, chunk_seconds, max_buffer_seconds, refresh_every_chunks, continue_on_error);
+      run_streaming(engine, jobs, chunk_seconds, refresh_every_chunks, continue_on_error);
     }
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";

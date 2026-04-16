@@ -16,9 +16,6 @@
 namespace pyannote {
 
 struct StreamingDiarizationConfig {
-  /// Keep at most this many seconds of audio at the segmentation model sample rate (VBx cost).
-  /// If <= 0, buffer grows without trimming (not recommended for long streams).
-  double max_buffer_seconds = 120.0;
   /// Run VBx + decode only after this many new analysis chunks since the last refresh (chunking
   /// matches ``CppAnnote::diarize`` sliding windows at model rate).
   int refresh_every_new_chunks = 2;
@@ -63,6 +60,7 @@ class StreamingDiarizationSession {
   StreamingDiarizationSession& operator=(const StreamingDiarizationSession&) = delete;
 
  private:
+  void cache_new_chunks();
   void trim_buffer_if_needed();
   void maybe_refresh(bool force);
   static void carry_last_updated_times(

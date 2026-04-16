@@ -119,7 +119,6 @@ int main(int argc, char** argv) {
         << "Optional:\n"
         << "  --golden-speaker-bounds PATH\n"
         << "  --chunk-seconds N            streaming simulated chunk (default 1.0)\n"
-        << "  --max-buffer-seconds N       streaming max buffer (default 300 = no trim for most files)\n"
         << "  --refresh-every-chunks N     streaming cluster/decode cadence (default 999999 = once at end)\n";
     return 2;
   }
@@ -131,8 +130,6 @@ int main(int argc, char** argv) {
     const std::string bounds_path = get_arg(argc, argv, "--golden-speaker-bounds");
     const std::string chunk_str = get_arg(argc, argv, "--chunk-seconds");
     const double chunk_sec = chunk_str.empty() ? 1.0 : std::stod(chunk_str);
-    const std::string buf_str = get_arg(argc, argv, "--max-buffer-seconds");
-    const double max_buf_sec = buf_str.empty() ? 300.0 : std::stod(buf_str);
     const std::string ref_str = get_arg(argc, argv, "--refresh-every-chunks");
     const int refresh_every = ref_str.empty() ? 999999 : std::stoi(ref_str);
 
@@ -316,7 +313,6 @@ int main(int argc, char** argv) {
         std::vector<float>(batch_resampled), batch_prof);
 
     pyannote::StreamingDiarizationConfig cfg;
-    cfg.max_buffer_seconds = max_buf_sec;
     cfg.refresh_every_new_chunks = refresh_every;
     pyannote::StreamingDiarizationSession sess(engine, cfg);
     sess.start_session();
