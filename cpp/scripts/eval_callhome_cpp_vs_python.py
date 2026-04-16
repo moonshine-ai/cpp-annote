@@ -125,7 +125,8 @@ def _json_diarization_to_annotation(path: Path, uri: str) -> Any:
 
     ann: Annotation = Annotation(uri=uri)
     with path.open(encoding="utf-8") as f:
-        turns = json.load(f)
+        data = json.load(f)
+    turns = data["turns"] if isinstance(data, dict) and "turns" in data else data
     for t in turns:
         ann[Segment(float(t["start"]), float(t["end"]))] = str(t["speaker"])
     return ann
@@ -233,6 +234,12 @@ def main() -> None:
         "--skip-dump",
         action="store_true",
         help="Reuse wavs + golden under --work-dir (must already match indices and truncation)",
+    )
+    ap.add_argument(
+        "--refresh-every-chunks",
+        type=int,
+        default=None,
+        help="Streaming: run cluster/decode every N new analysis chunks (passed to cpp-annote-cli)",
     )
     ap.add_argument(
         "--cpp-clustering-check",
@@ -363,7 +370,9 @@ def main() -> None:
             xv, pl = _hf_embedding_plda_paths(args.checkpoint, args.revision, token)
         xvec_resolved = xv
         plda_resolved = pl
-        print("Running C++ batch:", cpp_bin.name, flush=True)
+        if args.refresh_every_chunks is not None:
+            cmd_cpp += ["--refresh-every-chunks", str(args.refresh_every_chunks)]
+        print("Running C++ (streaming):", cpp_bin.name, flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
 
         if (

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -701,232 +702,157 @@ void CppAnnote::set_golden_speaker_bounds(std::string golden_speaker_bounds_json
   }
 }
 
-std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, std::int32_t sample_rate) {
-  const int sr_model = cfg_.sr_model;
+// ---------------------------------------------------------------------------
+// Per-chunk building blocks
+// ---------------------------------------------------------------------------
+
+std::vector<float> CppAnnote::extract_chunk_audio(
+    const float* audio, int64_t num_samples,
+    int64_t offset, int chunk_num_samples, int num_channels) {
+  std::vector<float> buf(
+      static_cast<size_t>(num_channels) * static_cast<size_t>(chunk_num_samples), 0.f);
+  for (int ch = 0; ch < num_channels; ++ch) {
+    for (int i = 0; i < chunk_num_samples; ++i) {
+      const int64_t si = offset + i;
+      if (si >= 0 && si < num_samples) {
+        buf[static_cast<size_t>(ch) * static_cast<size_t>(chunk_num_samples) +
+            static_cast<size_t>(i)] = audio[static_cast<size_t>(si)];
+      }
+    }
+  }
+  return buf;
+}
+
+std::vector<float> CppAnnote::run_segmentation_ort_single(const float* chunk_buf) {
   const int num_channels = cfg_.num_channels;
   const int chunk_num_samples = cfg_.chunk_num_samples;
-  const bool multilabel_export = cfg_.multilabel_export;
+  const std::array<int64_t, 3> in_shape{1, num_channels, chunk_num_samples};
+  Ort::Value in_tensor = Ort::Value::CreateTensor<float>(
+      mem_,
+      const_cast<float*>(chunk_buf),
+      static_cast<size_t>(1 * num_channels * chunk_num_samples),
+      in_shape.data(),
+      in_shape.size());
+  const char* in_names[] = {in_name_.get()};
+  const char* out_names[] = {out_name_.get()};
+  auto outs = session_.Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, 1);
+  float* op = outs[0].GetTensorMutableData<float>();
+  auto sh = outs[0].GetTensorTypeAndShapeInfo().GetShape();
+  if (sh.size() != 3 || sh[0] != 1) {
+    throw std::runtime_error("unexpected ORT output rank");
+  }
+  const int F = static_cast<int>(sh[1]);
+  const int K = static_cast<int>(sh[2]);
+  if (seg_F_ == 0) {
+    seg_F_ = F;
+    seg_K_ = K;
+  } else if (F != seg_F_ || K != seg_K_) {
+    throw std::runtime_error("ORT output shape changed across chunks");
+  }
+  return std::vector<float>(op, op + F * K);
+}
+
+std::vector<float> CppAnnote::run_embedding_ort_single(
+    const float* chunk_mono, const float* seg_binarized) {
+  const int F = seg_F_;
+  const int K = seg_K_;
+  const int dim = embed_dim_;
+  const int chunk_num_samples = cfg_.chunk_num_samples;
+  const int sr_model = cfg_.sr_model;
+  if (F <= 0 || K <= 0) {
+    throw std::runtime_error(
+        "run_embedding_ort_single: call run_segmentation_ort_single first");
+  }
+
+  std::vector<float> chunk_for_fbank(chunk_mono, chunk_mono + chunk_num_samples);
+  int wav_sr_use = sr_model;
+  if (sr_model != embed_sr_) {
+    chunk_for_fbank = wav_pcm::linear_resample(chunk_for_fbank, sr_model, embed_sr_);
+    wav_sr_use = embed_sr_;
+  }
+  const int chunk_embed_samples = static_cast<int>(chunk_for_fbank.size());
+  const int min_nf_seg =
+      embedding_exclude_overlap_
+          ? static_cast<int>(std::ceil(
+                static_cast<double>(F) * static_cast<double>(min_num_samples_) /
+                static_cast<double>(chunk_embed_samples)))
+          : -1;
+
+  int Tf = 0;
+  int Mfb = 0;
+  std::vector<float> fbank_all;
+  pyannote::fbank::wespeaker_like_fbank(
+      static_cast<float>(wav_sr_use),
+      embed_mel_bins_,
+      embed_frame_length_ms_,
+      embed_frame_shift_ms_,
+      chunk_for_fbank.data(),
+      static_cast<int>(chunk_for_fbank.size()),
+      fbank_all, Tf, Mfb);
+  if (Tf < 1 || Mfb != embed_mel_bins_) {
+    throw std::runtime_error("embedding fbank: unexpected frames or mel dimension");
+  }
+
+  std::vector<float> result(static_cast<size_t>(K) * static_cast<size_t>(dim));
+  for (int sp = 0; sp < K; ++sp) {
+    std::vector<float> clean_col(static_cast<size_t>(F), 0.f);
+    std::vector<float> full_col(static_cast<size_t>(F), 0.f);
+    for (int f = 0; f < F; ++f) {
+      float rowsum = 0.f;
+      for (int j = 0; j < K; ++j) {
+        rowsum += seg_binarized[f * K + j];
+      }
+      const float overlap_ok = (rowsum < 2.f - 1e-5f) ? 1.f : 0.f;
+      const float v = seg_binarized[f * K + sp];
+      full_col[static_cast<size_t>(f)] = v;
+      clean_col[static_cast<size_t>(f)] = v * overlap_ok;
+    }
+    float sum_clean = 0.f;
+    for (int f = 0; f < F; ++f) {
+      if (clean_col[static_cast<size_t>(f)] > 0.5f) {
+        sum_clean += 1.f;
+      }
+    }
+    const bool prefer_clean =
+        (min_nf_seg < 0) ? true : (sum_clean > static_cast<float>(min_nf_seg));
+    const std::vector<float>& src = prefer_clean ? clean_col : full_col;
+    float* dst = &result[static_cast<size_t>(sp) * static_cast<size_t>(dim)];
+    embedding_ort::run_embedding_ort(
+        *embed_session_, mem_, alloc_,
+        embed_inputs_fbank_then_weights_,
+        fbank_all.data(), Tf, Mfb,
+        src.data(), F, dst, dim);
+  }
+  return result;
+}
+
+std::vector<DiarizationTurn> CppAnnote::cluster_and_decode(
+    const std::vector<float>& seg_out,
+    const std::vector<float>& emb,
+    int C, DiarizationProfile& profile) {
+  using Clock = std::chrono::steady_clock;
+  const int F = seg_F_;
+  const int Kcls = seg_K_;
+  const int dim = embed_dim_;
   const double chunk_step_sec = cfg_.chunk_step_sec;
   const double chunk_dur_sec = cfg_.chunk_dur_sec;
-
-  std::vector<float> audio =
-      wav_pcm::linear_resample(audio_data, static_cast<int>(sample_rate), sr_model);
-
-  const int step_samples = static_cast<int>(std::lrint(chunk_step_sec * static_cast<double>(sr_model)));
-  if (step_samples <= 0 || chunk_num_samples <= 0) {
-    throw std::runtime_error("bad chunk/step samples");
+  if (F <= 0 || Kcls <= 0) {
+    throw std::runtime_error("cluster_and_decode: segmentation dimensions not yet discovered");
+  }
+  if (!cfg_.multilabel_export) {
+    throw std::runtime_error("CppAnnote expects export_includes_powerset_to_multilabel=true");
   }
 
-  const int64_t num_samples = static_cast<int64_t>(audio.size());
-  int64_t num_chunks = 0;
-  if (num_samples >= chunk_num_samples) {
-    num_chunks = (num_samples - chunk_num_samples) / step_samples + 1;
-  }
-  const bool has_last =
-      (num_samples < chunk_num_samples) || ((num_samples - chunk_num_samples) % step_samples > 0);
-  const int64_t total_chunks = num_chunks + (has_last ? 1 : 0);
-  if (total_chunks <= 0) {
-    return {};
-  }
+  std::vector<float> binarized = seg_out;
+
+  const auto t_vbx_start = Clock::now();
 
   std::vector<std::int8_t> hard_clusters_row;
-  const std::int8_t* hptr = nullptr;
+  clustering_vbx::vbx_clustering_hard(
+      *plda_model_, vbx_params_, C, F, Kcls, dim, emb.data(), binarized.data(), hard_clusters_row);
+  const std::int8_t* hptr = hard_clusters_row.data();
 
-  std::vector<float> seg_out;
-  int n_frames = 0;
-  int n_classes = 0;
-
-  auto run_chunk = [&](const float* wav_data, int64_t chunk_idx) {
-    const std::array<int64_t, 3> in_shape{1, num_channels, chunk_num_samples};
-    Ort::Value in_tensor = Ort::Value::CreateTensor<float>(
-        mem_,
-        const_cast<float*>(wav_data),
-        static_cast<size_t>(1 * num_channels * chunk_num_samples),
-        in_shape.data(),
-        in_shape.size());
-    const char* in_names[] = {in_name_.get()};
-    const char* out_names[] = {out_name_.get()};
-    auto outs = session_.Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, 1);
-    float* op = outs[0].GetTensorMutableData<float>();
-    auto sh = outs[0].GetTensorTypeAndShapeInfo().GetShape();
-    if (sh.size() != 3 || sh[0] != 1) {
-      throw std::runtime_error("unexpected ORT output rank");
-    }
-    const int F = static_cast<int>(sh[1]);
-    const int K = static_cast<int>(sh[2]);
-    if (chunk_idx == 0) {
-      n_frames = F;
-      n_classes = K;
-      seg_out.resize(static_cast<size_t>(total_chunks) * static_cast<size_t>(F) * static_cast<size_t>(K));
-    } else if (F != n_frames || K != n_classes) {
-      throw std::runtime_error("ORT output shape changed across chunks");
-    }
-    std::memcpy(
-        &seg_out[static_cast<size_t>(chunk_idx) * static_cast<size_t>(F) * static_cast<size_t>(K)],
-        op,
-        static_cast<size_t>(F * K) * sizeof(float));
-  };
-
-  for (int64_t c = 0; c < num_chunks; ++c) {
-    const int64_t off = c * step_samples;
-    std::vector<float> buf(static_cast<size_t>(num_channels) * static_cast<size_t>(chunk_num_samples), 0.f);
-    for (int ch = 0; ch < num_channels; ++ch) {
-      for (int i = 0; i < chunk_num_samples; ++i) {
-        const int64_t si = off + i;
-        float v = 0.f;
-        if (si >= 0 && si < num_samples) {
-          v = audio[static_cast<size_t>(si)];
-        }
-        buf[static_cast<size_t>(ch) * static_cast<size_t>(chunk_num_samples) + static_cast<size_t>(i)] = v;
-      }
-    }
-    run_chunk(buf.data(), c);
-  }
-  if (has_last) {
-    const int64_t off = num_chunks * step_samples;
-    std::vector<float> buf(static_cast<size_t>(num_channels) * static_cast<size_t>(chunk_num_samples), 0.f);
-    for (int ch = 0; ch < num_channels; ++ch) {
-      for (int i = 0; i < chunk_num_samples; ++i) {
-        const int64_t si = off + i;
-        float v = 0.f;
-        if (si >= 0 && si < num_samples) {
-          v = audio[static_cast<size_t>(si)];
-        }
-        buf[static_cast<size_t>(ch) * static_cast<size_t>(chunk_num_samples) + static_cast<size_t>(i)] = v;
-      }
-    }
-    run_chunk(buf.data(), num_chunks);
-  }
-
-  if (const char* dg = std::getenv("PYANNOTE_CPP_DIAG")) {
-    if (dg[0] == '1' && dg[1] == '\0') {
-      std::cerr << "[PYANNOTE_CPP_DIAG] sr_model=" << sr_model << " num_samples=" << num_samples
-                << " num_chunks=" << num_chunks << " has_last=" << (has_last ? 1 : 0)
-                << " total_chunks=" << total_chunks << " F=" << n_frames << " K=" << n_classes << "\n";
-    }
-  }
-
-  const int C = static_cast<int>(total_chunks);
-  const int F = n_frames;
-  const int Kcls = n_classes;
-  std::vector<float> binarized = seg_out;
-  if (!multilabel_export) {
-    throw std::runtime_error("CppAnnote expects export_includes_powerset_to_multilabel=true in ONNX sidecar");
-  }
-
-  {
-    const int dim = embed_dim_;
-    std::vector<float> emb(
-        static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim),
-        std::numeric_limits<float>::quiet_NaN());
-
-    for (int64_t ci = 0; ci < total_chunks; ++ci) {
-      const int64_t off = (ci < num_chunks) ? ci * step_samples : num_chunks * step_samples;
-      std::vector<float> chunk_mono(static_cast<size_t>(chunk_num_samples));
-      for (int i = 0; i < chunk_num_samples; ++i) {
-        const int64_t si = off + i;
-        float v = 0.f;
-        if (si >= 0 && si < num_samples) {
-          v = audio[static_cast<size_t>(si)];
-        }
-        chunk_mono[static_cast<size_t>(i)] = v;
-      }
-      std::vector<float> chunk_for_fbank = chunk_mono;
-      int wav_sr_use = sr_model;
-      if (sr_model != embed_sr_) {
-        chunk_for_fbank = wav_pcm::linear_resample(chunk_mono, sr_model, embed_sr_);
-        wav_sr_use = embed_sr_;
-      }
-      const int chunk_embed_samples = static_cast<int>(chunk_for_fbank.size());
-      const int min_nf_seg =
-          embedding_exclude_overlap_
-              ? static_cast<int>(std::ceil(static_cast<double>(F) * static_cast<double>(min_num_samples_) /
-                                           static_cast<double>(chunk_embed_samples)))
-              : -1;
-      int Tf = 0;
-      int Mfb = 0;
-      std::vector<float> fbank_all;
-      pyannote::fbank::wespeaker_like_fbank(
-          static_cast<float>(wav_sr_use),
-          embed_mel_bins_,
-          embed_frame_length_ms_,
-          embed_frame_shift_ms_,
-          chunk_for_fbank.data(),
-          static_cast<int>(chunk_for_fbank.size()),
-          fbank_all,
-          Tf,
-          Mfb);
-      if (Tf < 1 || Mfb != embed_mel_bins_) {
-        throw std::runtime_error("embedding fbank: unexpected frames or mel dimension");
-      }
-      for (int sp = 0; sp < Kcls; ++sp) {
-        std::vector<float> clean_col(static_cast<size_t>(F), 0.f);
-        std::vector<float> full_col(static_cast<size_t>(F), 0.f);
-        for (int f = 0; f < F; ++f) {
-          float rowsum = 0.f;
-          for (int j = 0; j < Kcls; ++j) {
-            rowsum += binarized[static_cast<size_t>((static_cast<size_t>(ci) * static_cast<size_t>(F) +
-                                                     static_cast<size_t>(f)) *
-                                                        static_cast<size_t>(Kcls) +
-                                                    static_cast<size_t>(j))];
-          }
-          const float overlap_ok = (rowsum < 2.f - 1e-5f) ? 1.f : 0.f;
-          const float v =
-              binarized[static_cast<size_t>((static_cast<size_t>(ci) * static_cast<size_t>(F) +
-                                             static_cast<size_t>(f)) *
-                                                static_cast<size_t>(Kcls) +
-                                            static_cast<size_t>(sp))];
-          full_col[static_cast<size_t>(f)] = v;
-          clean_col[static_cast<size_t>(f)] = v * overlap_ok;
-        }
-        float sum_clean = 0.f;
-        for (int f = 0; f < F; ++f) {
-          if (clean_col[static_cast<size_t>(f)] > 0.5f) {
-            sum_clean += 1.f;
-          }
-        }
-        const bool prefer_clean =
-            (min_nf_seg < 0) ? true : (sum_clean > static_cast<float>(min_nf_seg));
-        const std::vector<float>& src = prefer_clean ? clean_col : full_col;
-        float* dst = &emb[(static_cast<size_t>(ci) * static_cast<size_t>(Kcls) + static_cast<size_t>(sp)) *
-                          static_cast<size_t>(dim)];
-        // ONNX ``weights`` time axis matches segmentation frames ``F`` (see golden
-        // ``embedding_chunk0_spk0_ort.npz``); the graph resizes internally. Matches Torch
-        // ``resnet(fbank, weights=...)`` / golden ``embeddings.npz``, unlike
-        // ``ONNXWeSpeakerPretrainedSpeakerEmbedding.__call__`` which strips masked fbank rows
-        // before ORT.
-        embedding_ort::run_embedding_ort(
-            *embed_session_,
-            mem_,
-            alloc_,
-            embed_inputs_fbank_then_weights_,
-            fbank_all.data(),
-            Tf,
-            Mfb,
-            src.data(),
-            F,
-            dst,
-            dim);
-      }
-    }
-    if (parity::env_parity_level() >= 1) {
-      const size_t nemb =
-          static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim);
-      int nan_ct = 0;
-      for (size_t i = 0; i < nemb; ++i) {
-        if (std::isnan(emb[i])) {
-          ++nan_ct;
-        }
-      }
-      std::ostringstream oss;
-      oss << "emb ORT C=" << C << " Kcls=" << Kcls << " dim=" << dim << " nan_count=" << nan_ct
-          << " fp=" << parity::fingerprint_float32(emb.data(), nemb);
-      parity::log_light(oss.str());
-    }
-    clustering_vbx::vbx_clustering_hard(
-        *plda_model_, vbx_params_, C, F, Kcls, dim, emb.data(), binarized.data(), hard_clusters_row);
-    hptr = hard_clusters_row.data();
-  }
+  const auto t_after_vbx = Clock::now();
 
   double seg_ss = 0.;
   double seg_sd = chunk_dur_sec;
@@ -935,22 +861,21 @@ std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, s
   int Tcnt = 0;
   std::vector<std::uint8_t> cnt_u8 = speaker_count_initial_uint8(
       binarized,
-      static_cast<size_t>(C),
-      static_cast<size_t>(F),
-      static_cast<size_t>(Kcls),
-      seg_ss,
-      seg_st,
-      seg_sd,
-      rf_dur_,
-      rf_step_,
-      Tcnt);
+      static_cast<size_t>(C), static_cast<size_t>(F), static_cast<size_t>(Kcls),
+      seg_ss, seg_st, seg_sd, rf_dur_, rf_step_, Tcnt);
   std::uint8_t max_cnt = 0;
   for (std::uint8_t v : cnt_u8) {
     max_cnt = std::max(max_cnt, v);
   }
   if (max_cnt == 0) {
+    profile.clustering_vbx_sec = std::chrono::duration<double>(t_after_vbx - t_vbx_start).count();
+    profile.reconstruct_sec = 0.;
+    profile.total_chunks = C;
+    profile.num_frames = F;
+    profile.num_classes = Kcls;
     return {};
   }
+
   int max_cap = INT_MAX;
   if (!golden_bounds_body_.empty()) {
     const std::string& bj = golden_bounds_body_;
@@ -962,11 +887,6 @@ std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, s
   }
   std::vector<std::int8_t> count_i8 = cap_count(cnt_u8, max_cap);
 
-  // Match ``SpeakerDiarization.apply`` behavior: instantaneous count should not exceed the
-  // number of global speakers implied by VBx ``hard_clusters`` (``np.max(hard_clusters) + 1`` in Python).
-  // Otherwise a tiny ORT/Torch segmentation drift can push the per-frame sum to Kcls and inflate
-  // ``max_spf`` inside ``reconstruct_to_diarization``, adding spurious speaker columns beyond
-  // the detected cluster count.
   int max_cluster_id = -1;
   for (int ci = 0; ci < C; ++ci) {
     for (int j = 0; j < Kcls; ++j) {
@@ -1001,9 +921,7 @@ std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, s
 
   std::map<int, std::string> label_map;
   for (int k = 0; k < K_di; ++k) {
-    if (!label_map.count(k)) {
-      label_map[k] = default_speaker_label(k);
-    }
+    label_map[k] = default_speaker_label(k);
   }
   std::map<int, std::vector<pyannote_port::Segment>> by_label;
   for (int k = 0; k < K_di; ++k) {
@@ -1013,17 +931,8 @@ std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, s
           discrete[static_cast<size_t>(t) * static_cast<size_t>(K_di) + static_cast<size_t>(k)];
     }
     std::vector<std::pair<double, double>> regs;
-    binarize_column(
-        col.data(),
-        rows,
-        0.0,
-        rf_dur_,
-        rf_step_,
-        onset,
-        offset,
-        pad_onset,
-        pad_offset,
-        regs);
+    binarize_column(col.data(), rows, 0.0, rf_dur_, rf_step_,
+                    onset, offset, pad_onset, pad_offset, regs);
     if (!apply_annotation_support) {
       filter_min_duration_on(regs, min_on_);
     }
@@ -1050,6 +959,117 @@ std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, s
     }
   }
   std::sort(turns.begin(), turns.end());
+
+  const auto t_end = Clock::now();
+  profile.clustering_vbx_sec = std::chrono::duration<double>(t_after_vbx - t_vbx_start).count();
+  profile.reconstruct_sec = std::chrono::duration<double>(t_end - t_after_vbx).count();
+  profile.total_chunks = C;
+  profile.num_frames = F;
+  profile.num_classes = Kcls;
+  return turns;
+}
+
+// ---------------------------------------------------------------------------
+// Full-file entry points
+// ---------------------------------------------------------------------------
+
+std::vector<DiarizationTurn> CppAnnote::diarize(std::vector<float> audio_data, std::int32_t sample_rate) {
+  std::vector<float> audio =
+      wav_pcm::linear_resample(audio_data, static_cast<int>(sample_rate), cfg_.sr_model);
+  return diarize_mono_model_sr(std::move(audio));
+}
+
+std::vector<DiarizationTurn> CppAnnote::diarize_mono_model_sr(std::vector<float> audio) {
+  DiarizationProfile unused_profile;
+  return diarize_mono_model_sr(std::move(audio), unused_profile);
+}
+
+std::vector<DiarizationTurn> CppAnnote::diarize_mono_model_sr(std::vector<float> audio,
+                                                               DiarizationProfile& profile) {
+  using Clock = std::chrono::steady_clock;
+  const auto t_start = Clock::now();
+
+  const int sr_model = cfg_.sr_model;
+  const int num_channels = cfg_.num_channels;
+  const int chunk_num_samples = cfg_.chunk_num_samples;
+  const double chunk_step_sec = cfg_.chunk_step_sec;
+
+  const int step_samples = static_cast<int>(std::lrint(chunk_step_sec * static_cast<double>(sr_model)));
+  if (step_samples <= 0 || chunk_num_samples <= 0) {
+    throw std::runtime_error("bad chunk/step samples");
+  }
+
+  const int64_t num_samples = static_cast<int64_t>(audio.size());
+  int64_t num_chunks = 0;
+  if (num_samples >= chunk_num_samples) {
+    num_chunks = (num_samples - chunk_num_samples) / step_samples + 1;
+  }
+  const bool has_last =
+      (num_samples < chunk_num_samples) || ((num_samples - chunk_num_samples) % step_samples > 0);
+  const int64_t total_chunks = num_chunks + (has_last ? 1 : 0);
+  if (total_chunks <= 0) {
+    profile = DiarizationProfile{};
+    return {};
+  }
+
+  const int C = static_cast<int>(total_chunks);
+  const int FK_stride = [&]() -> int {
+    // Run first chunk to discover F and K.
+    auto buf0 = extract_chunk_audio(audio.data(), num_samples, 0, chunk_num_samples, num_channels);
+    auto s0 = run_segmentation_ort_single(buf0.data());
+    return seg_F_ * seg_K_;
+  }();
+  const int F = seg_F_;
+  const int Kcls = seg_K_;
+  const int dim = embed_dim_;
+
+  std::vector<float> seg_out(static_cast<size_t>(C) * static_cast<size_t>(FK_stride));
+  std::vector<float> emb(
+      static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim),
+      std::numeric_limits<float>::quiet_NaN());
+
+  // Segmentation pass — chunk 0 was already run above, but re-run for simplicity (cheap vs embedding).
+  for (int64_t c = 0; c < total_chunks; ++c) {
+    const int64_t off = (c < num_chunks) ? c * step_samples : num_chunks * step_samples;
+    auto buf = extract_chunk_audio(audio.data(), num_samples, off, chunk_num_samples, num_channels);
+    auto seg = run_segmentation_ort_single(buf.data());
+    std::memcpy(&seg_out[static_cast<size_t>(c) * static_cast<size_t>(FK_stride)],
+                seg.data(), static_cast<size_t>(FK_stride) * sizeof(float));
+  }
+
+  const auto t_after_seg = Clock::now();
+
+  // Embedding pass
+  for (int64_t c = 0; c < total_chunks; ++c) {
+    const int64_t off = (c < num_chunks) ? c * step_samples : num_chunks * step_samples;
+    auto mono = extract_chunk_audio(audio.data(), num_samples, off, chunk_num_samples, 1);
+    const float* seg_ptr = &seg_out[static_cast<size_t>(c) * static_cast<size_t>(FK_stride)];
+    auto chunk_emb = run_embedding_ort_single(mono.data(), seg_ptr);
+    std::memcpy(&emb[static_cast<size_t>(c) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim)],
+                chunk_emb.data(),
+                static_cast<size_t>(Kcls) * static_cast<size_t>(dim) * sizeof(float));
+  }
+
+  if (parity::env_parity_level() >= 1) {
+    const size_t nemb = static_cast<size_t>(C) * static_cast<size_t>(Kcls) * static_cast<size_t>(dim);
+    int nan_ct = 0;
+    for (size_t i = 0; i < nemb; ++i) {
+      if (std::isnan(emb[i])) { ++nan_ct; }
+    }
+    std::ostringstream oss;
+    oss << "emb ORT C=" << C << " Kcls=" << Kcls << " dim=" << dim << " nan_count=" << nan_ct
+        << " fp=" << parity::fingerprint_float32(emb.data(), nemb);
+    parity::log_light(oss.str());
+  }
+
+  const auto t_after_emb = Clock::now();
+
+  auto turns = cluster_and_decode(seg_out, emb, C, profile);
+
+  const auto t_end = Clock::now();
+  profile.segmentation_ort_sec = std::chrono::duration<double>(t_after_seg - t_start).count();
+  profile.embedding_ort_sec = std::chrono::duration<double>(t_after_emb - t_after_seg).count();
+  profile.total_sec = std::chrono::duration<double>(t_end - t_start).count();
   return turns;
 }
 

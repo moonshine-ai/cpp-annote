@@ -10,11 +10,50 @@
 #include "plda_vbx.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace pyannote {
+
+struct DiarizationProfile {
+  int total_chunks = 0;
+  int num_frames = 0;
+  int num_classes = 0;
+  double segmentation_ort_sec = 0.;
+  double embedding_ort_sec = 0.;
+  double clustering_vbx_sec = 0.;
+  double reconstruct_sec = 0.;
+  double total_sec = 0.;
+
+  void print(std::ostream& os, const char* prefix = "  ") const {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "%s%d chunks, %d frames, %d classes\n"
+                  "%ssegmentation_ort: %.3fs\n"
+                  "%sembedding_ort:    %.3fs\n"
+                  "%sclustering_vbx:   %.3fs\n"
+                  "%sreconstruct:      %.3fs\n"
+                  "%stotal:            %.3fs\n",
+                  prefix, total_chunks, num_frames, num_classes,
+                  prefix, segmentation_ort_sec,
+                  prefix, embedding_ort_sec,
+                  prefix, clustering_vbx_sec,
+                  prefix, reconstruct_sec,
+                  prefix, total_sec);
+    os << buf;
+  }
+
+  void accumulate(const DiarizationProfile& o) {
+    segmentation_ort_sec += o.segmentation_ort_sec;
+    embedding_ort_sec += o.embedding_ort_sec;
+    clustering_vbx_sec += o.clustering_vbx_sec;
+    reconstruct_sec += o.reconstruct_sec;
+    total_sec += o.total_sec;
+  }
+};
 
 struct DiarizationTurn {
   double start = 0.;
@@ -58,6 +97,53 @@ class CppAnnote {
   /// Mono PCM32-ish samples at ``sample_rate`` Hz; resampled internally to the model rate.
   std::vector<DiarizationTurn> diarize(std::vector<float> audio_data, std::int32_t sample_rate);
 
+  /// Same as ``diarize`` but waveform is already mono at ``segmentation_model_sample_rate()`` Hz
+  /// (``cfg`` sidecar ``sample_rate``). Used by streaming and parity tooling.
+  std::vector<DiarizationTurn> diarize_mono_model_sr(std::vector<float> waveform_model_sr);
+
+  /// Variant that also fills a ``DiarizationProfile`` with per-stage wall times.
+  std::vector<DiarizationTurn> diarize_mono_model_sr(std::vector<float> waveform_model_sr,
+                                                     DiarizationProfile& profile);
+
+  // ---- Per-chunk building blocks (used by streaming cache) -----------------
+
+  /// Extract a chunk window from ``audio`` at ``offset``, zero-padded to ``chunk_num_samples``.
+  /// Output is ``(num_channels * chunk_num_samples)`` floats.
+  static std::vector<float> extract_chunk_audio(
+      const float* audio, int64_t num_samples,
+      int64_t offset, int chunk_num_samples, int num_channels);
+
+  /// Run segmentation ORT for one prepared chunk.
+  /// ``chunk_buf`` has ``(num_channels * chunk_num_samples)`` floats at model rate.
+  /// Returns ``(F * K)`` floats.  Sets ``seg_F_`` / ``seg_K_`` on first call.
+  std::vector<float> run_segmentation_ort_single(const float* chunk_buf);
+
+  /// Run embedding ORT for all ``K`` local speakers of one chunk.
+  /// ``chunk_mono``: ``chunk_num_samples`` floats at model rate.
+  /// ``seg_binarized``: ``(F * K)`` from segmentation (multilabel).
+  /// Returns ``(K * embed_dim)`` floats.
+  std::vector<float> run_embedding_ort_single(
+      const float* chunk_mono, const float* seg_binarized);
+
+  /// VBx + reconstruct + binarize from pre-assembled tensors.
+  /// ``seg_out``: ``(C * F * K)``, ``emb``: ``(C * K * embed_dim)``.
+  /// Fills ``profile.clustering_vbx_sec`` and ``profile.reconstruct_sec``.
+  std::vector<DiarizationTurn> cluster_and_decode(
+      const std::vector<float>& seg_out,
+      const std::vector<float>& emb,
+      int C, DiarizationProfile& profile);
+
+  // ---- Accessors -----------------------------------------------------------
+
+  [[nodiscard]] int segmentation_model_sample_rate() const { return cfg_.sr_model; }
+  [[nodiscard]] int segmentation_num_channels() const { return cfg_.num_channels; }
+  [[nodiscard]] int segmentation_chunk_num_samples() const { return cfg_.chunk_num_samples; }
+  [[nodiscard]] double segmentation_chunk_step_sec() const { return cfg_.chunk_step_sec; }
+  [[nodiscard]] double segmentation_chunk_duration_sec() const { return cfg_.chunk_dur_sec; }
+  [[nodiscard]] int seg_frames_per_chunk() const { return seg_F_; }
+  [[nodiscard]] int seg_classes() const { return seg_K_; }
+  [[nodiscard]] int embedding_dimension() const { return embed_dim_; }
+
   /// Optional per-utterance ``golden_speaker_bounds.json`` for batch jobs. Empty string keeps the
   /// constructor default.
   void set_golden_speaker_bounds(std::string golden_speaker_bounds_json_path);
@@ -79,6 +165,8 @@ class CppAnnote {
   std::string golden_bounds_body_;
 
   SegConfig cfg_{};
+  int seg_F_ = 0;
+  int seg_K_ = 0;
   double rf_dur_ = 0.;
   double rf_step_ = 0.;
   double min_off_ = 0.;
