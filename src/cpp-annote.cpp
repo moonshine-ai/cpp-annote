@@ -486,17 +486,29 @@ bool try_regex_int(const std::string &json, const std::string &key_esc,
 
 }  // namespace
 
-CppAnnoteEngine::CppAnnoteEngine()
-    : ort_env_(ORT_LOGGING_LEVEL_WARNING, "cppannote"),
-      session_options_{},
-      session_(ort_env_,
-               cppannote::embedded_community1::segmentation_ort_data,
-               cppannote::embedded_community1::segmentation_ort_data_size,
-               session_options_),
-      mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
-      alloc_{},
-      in_name_(session_.GetInputNameAllocated(0, alloc_)),
-      out_name_(session_.GetOutputNameAllocated(0, alloc_)) {
+Ort::Session make_segmentation_session(Ort::Env &env,
+                                       Ort::SessionOptions &opts,
+                                       const std::string &path) {
+  if (!path.empty()) {
+    return Ort::Session(env, path.c_str(), opts);
+  }
+  return Ort::Session(
+      env, cppannote::embedded_community1::segmentation_ort_data,
+      cppannote::embedded_community1::segmentation_ort_data_size, opts);
+}
+
+std::unique_ptr<Ort::Session> make_embedding_session(
+    Ort::Env &env, Ort::SessionOptions &opts, const std::string &path) {
+  if (!path.empty()) {
+    return std::make_unique<Ort::Session>(env, path.c_str(), opts);
+  }
+  return std::make_unique<Ort::Session>(
+      env, cppannote::embedded_community1::embedding_ort_data,
+      cppannote::embedded_community1::embedding_ort_data_size, opts);
+}
+
+void CppAnnoteEngine::init_config_and_models(
+    const std::string &embedding_onnx_path) {
   const std::string seg_json(
       cppannote::embedded_community1::segmentation_json,
       cppannote::embedded_community1::segmentation_json_size);
@@ -558,11 +570,8 @@ CppAnnoteEngine::CppAnnoteEngine()
     embed_dim_ = static_cast<int>(json_double(emb_json, "embedding_dim"));
     embed_inputs_fbank_then_weights_ =
         embedding_ort::embedding_json_inputs_fbank_first(emb_json);
-    embed_session_ = std::make_unique<Ort::Session>(
-        ort_env_,
-        cppannote::embedded_community1::embedding_ort_data,
-        cppannote::embedded_community1::embedding_ort_data_size,
-        session_options_);
+    embed_session_ =
+        make_embedding_session(ort_env_, session_options_, embedding_onnx_path);
     min_num_samples_ = embedding_ort::discover_min_num_samples_embedding(
         *embed_session_, mem_, alloc_, embed_inputs_fbank_then_weights_,
         embed_sr_, embed_mel_bins_, embed_frame_length_ms_,
@@ -586,6 +595,30 @@ CppAnnoteEngine::CppAnnoteEngine()
     vbx_params_.max_clusters = 1000000000;
     vbx_params_.num_clusters = -1;
   }
+}
+
+CppAnnoteEngine::CppAnnoteEngine()
+    : ort_env_(ORT_LOGGING_LEVEL_WARNING, "cppannote"),
+      session_options_{},
+      session_(make_segmentation_session(ort_env_, session_options_, "")),
+      mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+      alloc_{},
+      in_name_(session_.GetInputNameAllocated(0, alloc_)),
+      out_name_(session_.GetOutputNameAllocated(0, alloc_)) {
+  init_config_and_models("");
+}
+
+CppAnnoteEngine::CppAnnoteEngine(const std::string &segmentation_onnx_path,
+                                   const std::string &embedding_onnx_path)
+    : ort_env_(ORT_LOGGING_LEVEL_WARNING, "cppannote"),
+      session_options_{},
+      session_(make_segmentation_session(ort_env_, session_options_,
+                                         segmentation_onnx_path)),
+      mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+      alloc_{},
+      in_name_(session_.GetInputNameAllocated(0, alloc_)),
+      out_name_(session_.GetOutputNameAllocated(0, alloc_)) {
+  init_config_and_models(embedding_onnx_path);
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +941,8 @@ struct CppAnnote::Impl {
   int32_t next_stream_id = 1;
 
   Impl() : engine() {}
+  Impl(const std::string& seg_path, const std::string& emb_path)
+      : engine(seg_path, emb_path) {}
 
   StreamingDiarizationSession &get_stream(int32_t id) {
     auto it = streams.find(id);
@@ -930,6 +965,11 @@ struct CppAnnote::Impl {
 };
 
 CppAnnote::CppAnnote() : impl_(std::make_unique<Impl>()) {}
+
+CppAnnote::CppAnnote(const std::string& segmentation_onnx_path,
+                      const std::string& embedding_onnx_path)
+    : impl_(std::make_unique<Impl>(segmentation_onnx_path,
+                                   embedding_onnx_path)) {}
 
 CppAnnote::~CppAnnote() = default;
 CppAnnote::CppAnnote(CppAnnote &&) noexcept = default;

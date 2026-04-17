@@ -263,6 +263,10 @@ int main(int argc, char** argv) {
            "audio (default 2.0)\n"
         << "  --analyze-cadence N        step between seg+emb model runs in "
            "seconds (>0, <=10; default: model's chunk_step_sec)\n\n"
+        << "Model override (use external ONNX files instead of compiled-in "
+           "models):\n"
+        << "  --segmentation-onnx PATH   path to segmentation .onnx file\n"
+        << "  --embedding-onnx PATH      path to embedding .onnx file\n\n"
         << "Other:\n"
         << "  --continue-on-error            print error and continue; exit 1 "
            "if any failed\n";
@@ -281,6 +285,9 @@ int main(int argc, char** argv) {
     const std::string analyze_str = get_arg(argc, argv, "--analyze-cadence");
     const double analyze_cadence =
         analyze_str.empty() ? 0.0 : std::stod(analyze_str);
+
+    const std::string seg_onnx = get_arg(argc, argv, "--segmentation-onnx");
+    const std::string emb_onnx = get_arg(argc, argv, "--embedding-onnx");
 
     std::vector<DiarJob> jobs;
     if (!manifest_path.empty()) {
@@ -310,7 +317,10 @@ int main(int argc, char** argv) {
       jobs.push_back({wav_path, out_path});
     }
 
-    cppannote::CppAnnote engine;
+    cppannote::CppAnnote engine =
+        (seg_onnx.empty() && emb_onnx.empty())
+            ? cppannote::CppAnnote()
+            : cppannote::CppAnnote(seg_onnx, emb_onnx);
 
     run_diarize(engine, jobs, cluster_cadence, analyze_cadence,
                 continue_on_error);

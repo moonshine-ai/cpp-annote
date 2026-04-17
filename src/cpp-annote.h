@@ -35,6 +35,11 @@ class CppAnnote {
   /// Construct the diarization engine from compiled-in community-1 model data.
   CppAnnote();
 
+  /// Construct with optional file-based ONNX models.  Pass an empty string
+  /// to use the compiled-in default for that model.
+  CppAnnote(const std::string& segmentation_onnx_path,
+            const std::string& embedding_onnx_path);
+
   ~CppAnnote();
 
   CppAnnote(const CppAnnote &) = delete;

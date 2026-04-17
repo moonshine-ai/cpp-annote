@@ -238,6 +238,18 @@ def main() -> None:
         help="Streaming: step between seg+emb model runs in seconds (>0, <=10; passed to cpp-annote-cli)",
     )
     ap.add_argument(
+        "--segmentation-onnx",
+        type=Path,
+        default=None,
+        help="Path to external segmentation .onnx file (passed to cpp-annote-cli; default: use compiled-in model)",
+    )
+    ap.add_argument(
+        "--embedding-onnx",
+        type=Path,
+        default=None,
+        help="Path to external embedding .onnx file (passed to cpp-annote-cli; default: use compiled-in model)",
+    )
+    ap.add_argument(
         "--cpp-clustering-check",
         action="store_true",
         help=(
@@ -348,6 +360,10 @@ def main() -> None:
             cmd_cpp += ["--cluster-cadence", str(args.cluster_cadence)]
         if args.analyze_cadence is not None:
             cmd_cpp += ["--analyze-cadence", str(args.analyze_cadence)]
+        if args.segmentation_onnx is not None:
+            cmd_cpp += ["--segmentation-onnx", str(args.segmentation_onnx.resolve())]
+        if args.embedding_onnx is not None:
+            cmd_cpp += ["--embedding-onnx", str(args.embedding_onnx.resolve())]
         print("Running C++ (streaming):", cpp_bin.name, flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
 
