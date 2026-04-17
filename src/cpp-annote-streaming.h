@@ -18,9 +18,14 @@
 namespace cppannote {
 
 struct StreamingDiarizationConfig {
-  /// Minimum seconds of new audio between VBx refreshes.  Converted internally
-  /// to an analysis-chunk count using the model's ``chunk_step_sec``.
-  double refresh_every_sec = 2.0;
+  /// Seconds between segmentation+embedding model runs (sliding-window step).
+  /// Must be >0 and <=10.  Defaults to 0 which means "use the model's
+  /// built-in ``chunk_step_sec``" (typically 1.0 s for community-1).
+  double analyze_cadence = 0.0;
+
+  /// Minimum seconds of new audio between VBx re-clustering passes.  Converted
+  /// internally to an analysis-chunk count using the effective analyze cadence.
+  double cluster_cadence = 2.0;
 };
 
 struct StreamingDiarizationTurn : DiarizationTurn {
@@ -81,8 +86,9 @@ class StreamingDiarizationSession {
 
   CppAnnoteEngine& engine_;
   StreamingDiarizationConfig cfg_{};
-  int refresh_every_chunks_ =
-      1;  // derived from cfg_.refresh_every_sec / chunk_step_sec
+  double effective_step_sec_ = 1.0;  // resolved analyze_cadence
+  int cluster_every_chunks_ =
+      1;  // derived from cfg_.cluster_cadence / effective_step_sec_
 
   std::vector<float> buffer_;
   double input_end_sec_ = 0.;

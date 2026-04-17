@@ -2,3 +2,4 @@
 /.callhome_eval_work/
 .venv/
 *.pyc
+__pycache__/

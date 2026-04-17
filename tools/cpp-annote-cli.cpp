@@ -153,7 +153,8 @@ static void print_timing(const char* tag, const std::string& path,
 
 static void run_diarize(cppannote::CppAnnote& engine,
                         const std::vector<DiarJob>& jobs,
-                        double refresh_every_sec, bool continue_on_error) {
+                        double cluster_cadence, double analyze_cadence,
+                        bool continue_on_error) {
   int n_fail = 0;
   double total_audio_sec = 0.;
   double total_wall_sec = 0.;
@@ -175,7 +176,7 @@ static void run_diarize(cppannote::CppAnnote& engine,
         }
       }
 
-      int32_t stream_id = engine.create_stream(refresh_every_sec);
+      int32_t stream_id = engine.create_stream(cluster_cadence, analyze_cadence);
       engine.start_stream(stream_id);
 
       constexpr double kSimChunkSec = 1.0;
@@ -258,8 +259,10 @@ int main(int argc, char** argv) {
         << "  --wav-list PATH            requires --out-dir; writes "
            "OUT/<stem>.json per line\n\n"
         << "Tuning:\n"
-        << "  --refresh-every N          re-cluster every N seconds of new "
-           "audio (default 2.0)\n\n"
+        << "  --cluster-cadence N        re-cluster every N seconds of new "
+           "audio (default 2.0)\n"
+        << "  --analyze-cadence N        step between seg+emb model runs in "
+           "seconds (>0, <=10; default: model's chunk_step_sec)\n\n"
         << "Other:\n"
         << "  --continue-on-error            print error and continue; exit 1 "
            "if any failed\n";
@@ -272,9 +275,12 @@ int main(int argc, char** argv) {
     const std::string out_dir = get_arg(argc, argv, "--out-dir");
     const bool continue_on_error = has_flag(argc, argv, "--continue-on-error");
 
-    const std::string refresh_str = get_arg(argc, argv, "--refresh-every");
-    const double refresh_every_sec =
-        refresh_str.empty() ? 2.0 : std::stod(refresh_str);
+    const std::string cluster_str = get_arg(argc, argv, "--cluster-cadence");
+    const double cluster_cadence =
+        cluster_str.empty() ? 2.0 : std::stod(cluster_str);
+    const std::string analyze_str = get_arg(argc, argv, "--analyze-cadence");
+    const double analyze_cadence =
+        analyze_str.empty() ? 0.0 : std::stod(analyze_str);
 
     std::vector<DiarJob> jobs;
     if (!manifest_path.empty()) {
@@ -306,7 +312,8 @@ int main(int argc, char** argv) {
 
     cppannote::CppAnnote engine;
 
-    run_diarize(engine, jobs, refresh_every_sec, continue_on_error);
+    run_diarize(engine, jobs, cluster_cadence, analyze_cadence,
+                continue_on_error);
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return 1;

@@ -714,12 +714,13 @@ std::vector<float> CppAnnoteEngine::run_embedding_ort_single(
 
 std::vector<DiarizationTurn> CppAnnoteEngine::cluster_and_decode(
     const std::vector<float> &seg_out, const std::vector<float> &emb, int C,
-    DiarizationProfile &profile) {
+    DiarizationProfile &profile, double chunk_step_sec_override) {
   using Clock = std::chrono::steady_clock;
   const int F = seg_F_;
   const int Kcls = seg_K_;
   const int dim = embed_dim_;
-  const double chunk_step_sec = cfg_.chunk_step_sec;
+  const double chunk_step_sec =
+      (chunk_step_sec_override > 0.0) ? chunk_step_sec_override : cfg_.chunk_step_sec;
   const double chunk_dur_sec = cfg_.chunk_dur_sec;
   if (F <= 0 || Kcls <= 0) {
     throw std::runtime_error(
@@ -934,10 +935,12 @@ CppAnnote::~CppAnnote() = default;
 CppAnnote::CppAnnote(CppAnnote &&) noexcept = default;
 CppAnnote &CppAnnote::operator=(CppAnnote &&) noexcept = default;
 
-int32_t CppAnnote::create_stream(double refresh_every_sec) {
+int32_t CppAnnote::create_stream(double cluster_cadence,
+                                 double analyze_cadence) {
   const int32_t id = impl_->next_stream_id++;
   StreamingDiarizationConfig cfg;
-  cfg.refresh_every_sec = refresh_every_sec;
+  cfg.cluster_cadence = cluster_cadence;
+  cfg.analyze_cadence = analyze_cadence;
   impl_->stream_configs[id] = cfg;
   impl_->streams[id] =
       std::make_unique<StreamingDiarizationSession>(impl_->engine, cfg);
@@ -971,7 +974,7 @@ DiarizationResults CppAnnote::diarize(const float *audio_data,
                                       int32_t sample_rate) {
   constexpr double kNeverRefresh = 1e18;
   StreamingDiarizationConfig cfg;
-  cfg.refresh_every_sec = kNeverRefresh;
+  cfg.cluster_cadence = kNeverRefresh;
   StreamingDiarizationSession sess(impl_->engine, cfg);
   sess.start_session();
   sess.add_audio_chunk(audio_data, static_cast<std::size_t>(audio_length),

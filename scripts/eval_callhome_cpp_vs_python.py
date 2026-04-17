@@ -219,16 +219,23 @@ def main() -> None:
         help="Path to cpp-annote-cli executable",
     )
     ap.add_argument("--skip-cpp", action="store_true", help="Skip C++ binary; only Python DER + golden dump")
+    ap.add_argument("--skip-pyannote", action="store_true", help="Skip pyannote Python pipeline; only C++ DER")
     ap.add_argument(
-        "--skip-dump",
+        "--dump-golden",
         action="store_true",
-        help="Reuse wavs + golden under --work-dir (must already match indices and truncation)",
+        help="Run golden dump (required for --cpp-clustering-check; skipped by default)",
     )
     ap.add_argument(
-        "--refresh-every",
+        "--cluster-cadence",
         type=float,
         default=None,
         help="Streaming: re-cluster every N seconds of new audio (passed to cpp-annote-cli)",
+    )
+    ap.add_argument(
+        "--analyze-cadence",
+        type=float,
+        default=None,
+        help="Streaming: step between seg+emb model runs in seconds (>0, <=10; passed to cpp-annote-cli)",
     )
     ap.add_argument(
         "--cpp-clustering-check",
@@ -242,15 +249,18 @@ def main() -> None:
 
     if args.num_files < 1:
         raise SystemExit("--num-files must be >= 1")
+    if args.cpp_clustering_check:
+        args.dump_golden = True
 
     try:
         from datasets import load_dataset
     except ImportError as e:
         raise SystemExit("Install datasets: pip install datasets") from e
 
-    from pyannote.audio import Pipeline
     from pyannote.core import Segment, Timeline
     from pyannote.metrics.diarization import DiarizationErrorRate
+    if not args.skip_pyannote:
+        from pyannote.audio import Pipeline
 
     work: Path = args.work_dir.resolve()
     wav_dir = work / "wavs"
@@ -284,23 +294,18 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     durations: list[float] = []
 
+    wav_dir.mkdir(parents=True, exist_ok=True)
     for i in range(start_index, hi):
         stem = _utterance_stem(args.subset, i, args.max_seconds)
         wav_path = wav_dir / f"{stem}.wav"
         row = ds[i]
-        if not args.skip_dump:
-            wav_dir.mkdir(parents=True, exist_ok=True)
-            dur = _save_wav_row(row, wav_path, args.max_seconds)
-            durations.append(dur)
-        else:
-            if not wav_path.is_file():
-                raise SystemExit(f"--skip-dump but missing wav: {wav_path}")
-            durations.append(_wav_duration_sec(wav_path))
+        dur = _save_wav_row(row, wav_path, args.max_seconds)
+        durations.append(dur)
         stems.append(stem)
         wav_paths.append(wav_path.resolve())
         rows.append(row)
 
-    if not args.skip_dump:
+    if args.dump_golden:
         golden_root.mkdir(parents=True, exist_ok=True)
         dump_py = _REPO_ROOT / "scripts" / "dump_diarization_golden.py"
         cmd = [
@@ -339,8 +344,10 @@ def main() -> None:
             "--manifest",
             str(manifest_path),
         ]
-        if args.refresh_every is not None:
-            cmd_cpp += ["--refresh-every", str(args.refresh_every)]
+        if args.cluster_cadence is not None:
+            cmd_cpp += ["--cluster-cadence", str(args.cluster_cadence)]
+        if args.analyze_cadence is not None:
+            cmd_cpp += ["--analyze-cadence", str(args.analyze_cadence)]
         print("Running C++ (streaming):", cpp_bin.name, flush=True)
         subprocess.run(cmd_cpp, cwd=str(_REPO_ROOT), check=True)
 
@@ -358,24 +365,26 @@ def main() -> None:
                     check=False,
                 )
 
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            device = torch.device("mps")
+    pipeline = None
+    if not args.skip_pyannote:
+        if args.device == "auto":
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
         else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(args.device)
+            device = torch.device(args.device)
 
-    pipeline = Pipeline.from_pretrained(
-        args.checkpoint,
-        revision=args.revision,
-        token=token,
-    )
-    if pipeline is None:
-        raise SystemExit("Pipeline.from_pretrained returned None (token / download error).")
-    pipeline.to(device)
+        pipeline = Pipeline.from_pretrained(
+            args.checkpoint,
+            revision=args.revision,
+            token=token,
+        )
+        if pipeline is None:
+            raise SystemExit("Pipeline.from_pretrained returned None (token / download error).")
+        pipeline.to(device)
 
     py_ders: list[float] = []
     cpp_ders: list[float] = []
@@ -398,11 +407,13 @@ def main() -> None:
         ref = _row_to_reference(row, crop_end=dur, uri=uri)
         uem = Timeline([Segment(0.0, dur)])
 
-        file = {"audio": str(wav_path), "uri": uri}
-        with torch.inference_mode():
-            out = pipeline(file)
-        hyp_py = out.speaker_diarization
-        der_py = float(DiarizationErrorRate()(ref, hyp_py, uem=uem))
+        der_py = float("nan")
+        if pipeline is not None:
+            file = {"audio": str(wav_path), "uri": uri}
+            with torch.inference_mode():
+                out = pipeline(file)
+            hyp_py = out.speaker_diarization
+            der_py = float(DiarizationErrorRate()(ref, hyp_py, uem=uem))
         py_ders.append(der_py)
 
         der_cpp = float("nan")

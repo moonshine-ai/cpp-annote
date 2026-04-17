@@ -32,12 +32,20 @@ double segment_iou(double a0, double a1, double b0, double b1) {
 StreamingDiarizationSession::StreamingDiarizationSession(
     CppAnnoteEngine& engine, StreamingDiarizationConfig config)
     : engine_(engine), cfg_(std::move(config)) {
-  cfg_.refresh_every_sec = std::max(0.0, cfg_.refresh_every_sec);
-  const double step = engine_.segmentation_chunk_step_sec();
-  refresh_every_chunks_ =
-      (step > 0.0)
-          ? std::max(
-                1, static_cast<int>(std::lrint(cfg_.refresh_every_sec / step)))
+  if (cfg_.analyze_cadence == 0.0) {
+    effective_step_sec_ = engine_.segmentation_chunk_step_sec();
+  } else {
+    if (cfg_.analyze_cadence <= 0.0 || cfg_.analyze_cadence > 10.0) {
+      throw std::runtime_error(
+          "StreamingDiarizationConfig::analyze_cadence must be >0 and <=10");
+    }
+    effective_step_sec_ = cfg_.analyze_cadence;
+  }
+  cfg_.cluster_cadence = std::max(0.0, cfg_.cluster_cadence);
+  cluster_every_chunks_ =
+      (effective_step_sec_ > 0.0)
+          ? std::max(1, static_cast<int>(
+                            std::lrint(cfg_.cluster_cadence / effective_step_sec_)))
           : 1;
 }
 
@@ -62,9 +70,9 @@ void StreamingDiarizationSession::trim_buffer_if_needed() {
   // fully captured in the seg/emb cache).  Keep the chunk window plus two
   // steps of margin so the tail always has room to be recomputed.
   const double keep_sec = engine_.segmentation_chunk_duration_sec() +
-                          2.0 * engine_.segmentation_chunk_step_sec();
+                          2.0 * effective_step_sec_;
   const int step_samples = static_cast<int>(std::lrint(
-      engine_.segmentation_chunk_step_sec() * static_cast<double>(sr)));
+      effective_step_sec_ * static_cast<double>(sr)));
   const std::size_t cap = static_cast<std::size_t>(std::max(1., keep_sec) *
                                                    static_cast<double>(sr));
   if (buffer_.size() <= cap) {
@@ -92,7 +100,7 @@ void StreamingDiarizationSession::cache_new_chunks() {
   const int num_channels = engine_.segmentation_num_channels();
   const int chunk_num_samples = engine_.segmentation_chunk_num_samples();
   const int step_samples = static_cast<int>(std::lrint(
-      engine_.segmentation_chunk_step_sec() * static_cast<double>(sr_model)));
+      effective_step_sec_ * static_cast<double>(sr_model)));
   if (step_samples <= 0 || chunk_num_samples <= 0) {
     return;
   }
@@ -174,9 +182,8 @@ void StreamingDiarizationSession::maybe_refresh(bool force) {
   const int sr_model = engine_.segmentation_model_sample_rate();
   const int num_channels = engine_.segmentation_num_channels();
   const int chunk_num_samples = engine_.segmentation_chunk_num_samples();
-  const double chunk_step_sec = engine_.segmentation_chunk_step_sec();
   const int step_samples = static_cast<int>(
-      std::lrint(chunk_step_sec * static_cast<double>(sr_model)));
+      std::lrint(effective_step_sec_ * static_cast<double>(sr_model)));
   if (step_samples <= 0 || chunk_num_samples <= 0) {
     return;
   }
@@ -207,7 +214,7 @@ void StreamingDiarizationSession::maybe_refresh(bool force) {
   if (!force) {
     if (last_refresh_total_chunks_ >= 0) {
       if (total_chunks_ever <
-          last_refresh_total_chunks_ + refresh_every_chunks_) {
+          last_refresh_total_chunks_ + cluster_every_chunks_) {
         return;
       }
     }
@@ -287,7 +294,8 @@ void StreamingDiarizationSession::maybe_refresh(bool force) {
       std::chrono::duration<double>(t_after_seg_emb - t_seg_start).count();
 
   std::vector<DiarizationTurn> raw =
-      engine_.cluster_and_decode(seg_out, emb_all, C_full, prof);
+      engine_.cluster_and_decode(seg_out, emb_all, C_full, prof,
+                                 effective_step_sec_);
 
   prof.segmentation_ort_sec = 0.;
   prof.total_sec =

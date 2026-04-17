@@ -47,8 +47,11 @@ class CppAnnote {
                              int32_t sample_rate = 16000);
 
   /// Allocate a new streaming diarization session and return its handle.
-  /// ``refresh_every_sec`` controls how often re-clustering runs.
-  int32_t create_stream(double refresh_every_sec = 2.0);
+  /// ``cluster_cadence`` controls how often VBx re-clustering runs (seconds).
+  /// ``analyze_cadence`` controls the step between segmentation+embedding model
+  /// runs (seconds, must be >0 and <=10; 0 means use the model default).
+  int32_t create_stream(double cluster_cadence = 2.0,
+                        double analyze_cadence = 0.0);
 
   /// Release a stream and all associated resources.
   void free_stream(int32_t stream_id);
