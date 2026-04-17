@@ -1,4 +1,4 @@
-# CPP-Annote
+# Cpp-Annote
 
 Port of the [pyannote](https://github.com/pyannote/pyannote-audio) diarization framework from Python to C++.
 
